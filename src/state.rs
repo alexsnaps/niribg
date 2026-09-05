@@ -82,16 +82,7 @@ impl State {
     /// left `None` in `patch` keep their existing value, so repeated `set`s
     /// accumulate (`set a.jpg` then `set --mode fit` → both stick).
     pub fn apply_set(&mut self, slot: &str, patch: OutputConfig) {
-        let entry = self.output.entry(slot.to_string()).or_default();
-        if patch.path.is_some() {
-            entry.path = patch.path;
-        }
-        if patch.mode.is_some() {
-            entry.mode = patch.mode;
-        }
-        if patch.color.is_some() {
-            entry.color = patch.color;
-        }
+        crate::config::merge_output_patch(self.output.entry(slot.to_string()).or_default(), patch);
     }
 
     /// Overlay these overrides onto `cfg`, state winning key by key.

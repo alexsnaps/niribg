@@ -142,6 +142,20 @@ impl OutputConfig {
     }
 }
 
+/// Fold the fields a single `niribg set` provided into `into`, leaving unset
+/// fields untouched so repeated `set`s on one slot accumulate.
+pub(crate) fn merge_output_patch(into: &mut OutputConfig, patch: OutputConfig) {
+    if patch.path.is_some() {
+        into.path = patch.path;
+    }
+    if patch.mode.is_some() {
+        into.mode = patch.mode;
+    }
+    if patch.color.is_some() {
+        into.color = patch.color;
+    }
+}
+
 /// A fully resolved wallpaper spec for one output: no more `Option`s, paths
 /// expanded to absolute.
 #[derive(Debug, Clone, PartialEq)]

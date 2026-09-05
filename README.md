@@ -4,9 +4,10 @@ Wallpaper daemon for the [niri](https://github.com/YaLTeR/niri) Wayland
 compositor, with **blur on overview**: your wallpaper is sharp while you work
 and fades to a blurred, dimmed backdrop whenever niri's overview is open.
 
-> Status: early. M0 skeleton — the CLI, config, and control socket exist; the
-> `daemon` does not draw anything yet. See [`DESIGN.md`](DESIGN.md) for the
-> full plan and milestones.
+> Status: early. **M1 done** — `niribg daemon` draws per-output colour and
+> image wallpapers on niri with correct fractional scaling, hotplug, and
+> `set` / `reload` / `reset`. Blur on overview (M2) and transitions (M3) are
+> next. See [`DESIGN.md`](DESIGN.md) for the plan and milestones.
 
 ## Why
 

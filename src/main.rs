@@ -132,12 +132,7 @@ fn socket_path(cli: &Cli) -> Result<PathBuf> {
 }
 
 fn run_daemon(cli: &Cli, replace: bool) -> Result<()> {
-    let (config, from) = daemon::load_config(cli.config.as_deref())?;
-    match &from {
-        Some(p) => tracing::info!(path = %p.display(), "loaded config"),
-        None => tracing::info!("no config file; using defaults"),
-    }
-    daemon::run(&socket_path(cli)?, config, replace)
+    daemon::run(&socket_path(cli)?, cli.config.clone(), replace)
 }
 
 fn run_simple(cli: &Cli, cmd: &Command) -> Result<()> {

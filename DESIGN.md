@@ -376,11 +376,12 @@ Each is independently testable.
   `UnixListener` accept loop (replaced by the `calloop` loop in M1 so its
   version is co-selected with SCTK); `niribg get` / `version` / `quit` work
   over the socket, `get` returning a stub status.
-- **M1 — Static wallpaper.** SCTK connect, output enumeration, one
+- **M1 — Static wallpaper. ✅ done.** SCTK connect, output enumeration, one
   `background` surface per output, shm, fractional scale + viewporter. Decode
   + fit-mode math + Lanczos scale + colour source. Commit sharp buffer.
   Hotplug. `set` → worker decode → commit (no fade). `state.json` +
-  `--no-persist` + `reset`. **→ usable `swaybg` replacement.**
+  `--no-persist` + `reset`. **→ usable `swaybg` replacement.** (See §13 for
+  the implementation notes and carried-forward items.)
 - **M2 — niri IPC + blur.** `niri-ipc` `calloop` source, backoff reconnect,
   resync via `overview-state`. Downscale → stack blur → upscale + dim, eager
   on the worker. Overview event → blur target 0/1 (snap, no fade yet).
@@ -393,3 +394,240 @@ Each is independently testable.
   pass, golden tests, `clap_mangen` man page, `contrib/niribg.service`,
   `examples/config.toml`, `CHANGELOG`, cargo-dist, tag `0.1.0`, publish to
   crates.io + GitHub Releases.
+
+---
+
+## 13. M1 implementation notes
+
+Decisions from the M1 design pass. These refine §2–§10 for the "static
+wallpaper" milestone; nothing here changes the v1 scope.
+
+### Reconnaissance (niri 26.04, SCTK 0.21)
+
+- niri advertises `wp_fractional_scale_manager_v1` v1, `wp_viewporter` v1,
+  `zwlr_layer_shell_v1` v5, `wl_compositor` v6, `wl_output` v4, `wl_shm` v2.
+- niri does **not** advertise `wp_single_pixel_buffer_v1` → a solid-colour
+  wallpaper is an shm buffer filled with the colour (one code path with
+  images).
+- **SCTK 0.21 has no fractional-scale or viewporter support** → both
+  protocols are wired by hand (`wayland-protocols` `staging` + `Dispatch`
+  impls on the daemon state).
+- SCTK 0.21 bundles `calloop` 0.14 + `calloop-wayland-source` 0.4 as default
+  features and re-exports them → no version-skew risk.
+- `ext_background_effect_manager_v1` is present on niri. Investigated for M2:
+  it blurs what is *behind* a surface, and the wallpaper is the bottom-most
+  surface, so it does not apply. M2 stays precompute-blur + crossfade.
+
+### Event loop
+
+Single-threaded `calloop`. The only thread is the image worker; it crosses
+back via one `calloop::channel` carrying `Vec<u8>` payloads only.
+
+- **Control socket:** `Generic` source on the listener fd
+  (`set_nonblocking(true)`); on readable, `accept()`; each accepted stream
+  becomes its own `Generic` source that accumulates bytes to `\n`, dispatches
+  once, writes one reply line, then is dropped. No locking around daemon
+  state.
+
+### Reply timing
+
+| Command | Reply |
+| --- | --- |
+| `version`, `get`, `quit` | immediate |
+| `set` | **deferred** — the client's `UnixStream` is stashed by token; the worker result(s) for that token produce the `ok` / `err` (with per-output failures) |
+| `reload`, `reset` | immediate `ok` once config is re-read and jobs are enqueued; decode errors surface via `niribg get`'s per-output `error` and logs |
+
+If the client's 5 s read timeout fires first, the daemon still applies the
+result. A client that disconnected before the deferred write just has its
+write dropped.
+
+### Image worker
+
+```
+Job      { token: u64, output: String, target: PixelSize, source: Resolved }
+Result   { token: u64, output: String, outcome: Result<Rendered, String> }
+Rendered { pixels: Vec<u8> /* BGRA, exact stride */, size: PixelSize }
+```
+
+One worker, FIFO. Worker: 100 MP dimension check → decode → Lanczos3 resize
+per fit mode → compose over the fill colour → `Vec<u8>`. Never touches
+Wayland. Colour-only sources are composed inline on the loop (no worker
+round-trip). One job per (output × set). **Generation counter deferred to
+M3** — no fade in M1, so a rapid `set A`→`set B` on one output is at worst a
+one-frame flicker.
+
+### Fractional scale
+
+- Bind `wp_fractional_scale_manager_v1` + `wp_viewporter`; per surface
+  `get_fractional_scale` + `get_viewport`. `preferred_scale` carries the
+  scale in 1/120ths (u32).
+- Physical buffer = `ceil(logical_w × scale / 120) × ceil(logical_h × scale
+  / 120)`. Render there; `viewport.set_destination(logical_w, logical_h)`;
+  `surface.set_buffer_scale(1)`.
+- `preferred_scale` change → re-render that output.
+- **Fallback** when `wp_fractional_scale_manager_v1` is absent (Sway etc.):
+  integer scale via `wl_surface.preferred_buffer_scale` / output scale,
+  `set_buffer_scale(n)`, no viewport. ~15 lines; correct on 1×/2×.
+
+### `render.rs` (pure, unit-tested)
+
+`place(src: Size, dst: Size, mode) -> Placement { dst_rect, src_crop }`, then
+`compose(placement, src_pixels, fill, out, out_size, stride)`.
+
+| Mode | Behaviour |
+| --- | --- |
+| `fill` | Lanczos3 cover, centred crop, no fill visible |
+| `fit` | Lanczos3 contain, centred, `fill` in the bars |
+| `stretch` | Lanczos3 to exactly `dst` |
+| `center` | **1:1 physical pixels**, centred; crop if larger, `fill` border if smaller (matches `swaybg`) |
+
+`fill`/`fit`/`stretch` do one Lanczos3 pass straight to the final rect size.
+`center` does no scaling. EXIF orientation is ignored in M1.
+
+### `ipc.rs` boundary
+
+```rust
+enum Reply { Now(WireReply), Deferred(Token), Shutdown(WireReply) }
+
+trait Control {
+    fn status(&self) -> Status;
+    fn apply_set(&mut self, req: SetRequest) -> SetDispatch;   // Deferred(token) | Now(err)
+    fn reload(&mut self) -> anyhow::Result<ReloadSummary>;
+    fn reset(&mut self)  -> anyhow::Result<ReloadSummary>;
+}
+
+fn dispatch(req: Request, ctl: &mut impl Control) -> Reply
+```
+
+`DaemonState` implements `Control` in `daemon/mod.rs`. Tests drive `dispatch`
+against a `FakeControl`. The deferred-reply plumbing (stash `UnixStream` by
+token, match worker results) lives in `daemon/mod.rs`, not `ipc.rs`. M0's
+`ipc::tests` port to `FakeControl`.
+
+### Dependencies added
+
+```toml
+smithay-client-toolkit = "0.21"
+wayland-client   = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+image = { version = "0.25", default-features = false,
+          features = ["jpeg", "png", "gif", "bmp", "tiff", "webp"] }
+calloop = { version = "0.14", features = ["signals"] }
+```
+
+`cargo-deny`'s license allowlist gains `MPL-2.0` if a wayland-rs crate trips
+it.
+
+### Startup & signals
+
+1. args → logging.
+2. `Config::load` + `State::load` → effective config (`config ← state`).
+3. `Connection::connect_to_env` → `registry_queue_init` → bind required
+   globals (`wl_compositor`, `wl_shm`, `zwlr_layer_shell_v1`, `wl_output`).
+   A missing required global, or a connect failure → exit non-zero with a
+   message naming it. `wp_fractional_scale_manager_v1` / `wp_viewporter` are
+   optional (fallback above).
+4. calloop loop: `WaylandSource`, control-socket `Generic`, worker-result
+   `channel`, signal source.
+5. Per output as it arrives: `background` layer surface (namespace `niribg`,
+   anchor all, exclusive `-1`, no keyboard, empty input region, size `0×0`)
+   + fractional-scale + viewport. First `configure` → paint (colour inline;
+   image → worker job).
+
+| Signal | Action |
+| --- | --- |
+| `SIGHUP` | reload |
+| `SIGTERM` / `SIGINT` | clean shutdown: drop surfaces, unlink socket, exit `0` |
+
+### `set` semantics
+
+| `path` | `--color` | Result |
+| --- | --- | --- |
+| set | — | image, letterbox = current/default colour |
+| set | set | image, letterbox = given colour |
+| — | set | solid colour |
+| — | — | error: "provide an image path or --color" |
+
+- `--output NAME` → that connector's slot; no `--output` → the `default`
+  slot, applied to every connected output with **no `[output."NAME"]`**
+  override (a named override always wins over a `default`-slot `set`).
+- `--output` naming a disconnected connector → accept, persist, reply `ok`
+  with an informational note; applies on hotplug.
+- Order: build field-wise `patch` → (unless `--no-persist`)
+  `state.apply_set` + `state.save` → rebuild effective config → re-resolve
+  affected outputs → enqueue one job per affected connected output sharing a
+  `token` → last job for the token produces the reply.
+
+### shm & commit
+
+One shared `SlotPool`, `Xrgb8888`, opaque region = full surface. Commit:
+attach at (0,0) → `damage_buffer(0,0,w,h)` → `viewport.set_destination` →
+`commit`. SCTK acks the layer-surface configure. No frame callbacks in M1
+(those arrive with transitions in M3).
+
+### `DaemonState` shape
+
+Keyed by `wl_output` `ObjectId`. Per entry: connector name, surface, layer
+surface, optional frac/viewport objects, `scale_120`, last logical size,
+current `Resolved` spec, `status` (Pending | Loaded | Failed(String)),
+`last_token`. Plus: effective `config`, last-read `disk_config`, runtime
+`state`, `config_path`, `state_path`, `worker_tx`, `next_token`,
+`pending_sets: HashMap<Token, {stream, outstanding, failures}>`,
+`loop_signal`. `get` lists live outputs **and** configured-but-disconnected
+named slots.
+
+### Tests added in M1
+
+- `render::place` / `render::compose` across all four modes and
+  src/dst-size relationships; stride with awkward widths; Lanczos sanity.
+- `scale_120` physical-size math (1.0, 1.25, 1.5, 2.0).
+- config diff for `reload` (which output names changed).
+- `set` arg → `patch` + the source-resolution table (incl. both-absent
+  error).
+- `ipc::dispatch` against `FakeControl` (ports M0's `ipc::tests`).
+- `pending_sets`: multi-output token, partial failure lists failures,
+  client-gone drops cleanly.
+- worker integration: PNG fixture in `tests/fixtures/` → `Rendered`; missing
+  path / oversize → `Err`.
+- full socket round-trip against a stub-Wayland `DaemonState`.
+
+Golden-image tests stay M3.
+
+### Build order
+
+1. ✅ Deps + calloop skeleton (control socket + signals in calloop; `Control`
+   trait; port `ipc::tests`; `set` still stubbed).
+2. ✅ `render.rs` pure + tests.
+3. ✅ Worker thread + `calloop::channel` + fixture tests.
+4. ✅ Layer surfaces + fractional scale (+ integer fallback); paint fill
+   colour. Multi-output + hotplug.
+5. ✅ Wire image sources through the worker; `get` reports live
+   `logical`/`loaded`/`error`.
+6. ✅ `set` / `reload` / `reset` for real; deferred replies;
+   disconnected-output stored sets.
+
+### M1 status — done
+
+Verified on niri 26.04: colour + image wallpapers on the `background` layer,
+fractional scale 1.5 → physical 2880×1800 buffers, `set` (persist /
+`--no-persist` / `--output` / `--mode` / `--color`, named-override-wins,
+disconnected-output stored + noted), `reload` (re-resolve + repaint changed),
+`reset` (clear `state.json`), live `niribg get`, hotplug, and the failure
+paths (no compositor / broken config / missing required global → exit 1 with
+a message). 62 unit tests; clippy + fmt clean.
+
+Carried forward:
+
+- **Generation counter** for rapid `set` stays M3 (M1 uses a
+  `physical() == rendered.size` staleness check).
+- **`--no-persist` is dropped by `reload`/`reset`** (it never enters
+  `state.json`) — documented behaviour, not a bug.
+- **First image paint** shows the fill colour for the ~decode+Lanczos
+  duration (a 4× upscale is ~300 ms), then swaps. M3's crossfade will make
+  the swap a fade; a faster resize (`fast_image_resize`) is a later option.
+- **`DaemonState` integration-test harness** (stub Wayland + socket
+  round-trip from DESIGN §10) not built — the command-dispatch layer is
+  covered by `ipc::dispatch` + `FakeControl`, and step 6 behaviour was
+  verified manually against niri. Revisit when `DaemonState` stabilises.
+- **`update_output`** is a no-op; `configure` + `preferred_scale` cover
+  runtime resolution/scale changes.
