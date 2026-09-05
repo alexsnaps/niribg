@@ -7,9 +7,12 @@
 //! that lacks those globals falls back to integer `wl_surface` buffer scale.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
+use smithay_client_toolkit::compositor::{
+    CompositorHandler, CompositorState, FrameCallbackData, Region,
+};
 use smithay_client_toolkit::dispatch2::Dispatch2;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
@@ -34,6 +37,7 @@ use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1:
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 
+use super::anim::Anim;
 use super::ipc::{SetDispatch, SetRequest};
 use super::render::{self, Size};
 use super::{DaemonState, PendingSet};
@@ -55,6 +59,7 @@ pub(super) struct Wayland {
     pub layer_shell: LayerShell,
     pub frac_mgr: Option<WpFractionalScaleManagerV1>,
     pub viewporter: Option<WpViewporter>,
+    pub qh: QueueHandle<DaemonState>,
     pub outputs: HashMap<ObjectId, OutputEntry>,
 }
 
@@ -91,6 +96,7 @@ impl Wayland {
             layer_shell,
             frac_mgr,
             viewporter,
+            qh: qh.clone(),
             outputs: HashMap::new(),
         })
     }
@@ -118,12 +124,36 @@ pub(super) struct OutputEntry {
     pub status: PaintStatus,
     /// Physical size of the buffer currently on screen, if any.
     pub painted: Option<Size>,
-    /// The last render's buffers, retained so an overview toggle is an
-    /// instant swap (and M3's crossfade has both to blend). Both are BGRA at
-    /// `buffers_size`.
+    /// The last render's buffers, retained so an overview toggle / `set` can
+    /// crossfade between them. Both are BGRA at `buffers_size`.
     pub sharp: Option<Vec<u8>>,
     pub blurred: Option<Vec<u8>>,
     pub buffers_size: Option<Size>,
+    /// Which of the two buffers is (or is fading toward being) on screen.
+    pub showing: Showing,
+    /// An in-flight crossfade, driven by frame callbacks.
+    pub transition: Option<Transition>,
+    /// A frame callback is outstanding (don't stack them).
+    pub frame_pending: bool,
+    /// Bumped before each render job; a result with a stale generation is
+    /// dropped (M3).
+    pub generation: u64,
+}
+
+/// Which composited buffer an output is showing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Showing {
+    Sharp,
+    Blurred,
+}
+
+/// An in-flight crossfade: displayed pixels are `blend(from, to, anim.eased())`
+/// until `anim.done()`, then `to` exactly. `from`/`to` are BGRA at `size`.
+pub(super) struct Transition {
+    pub from: Vec<u8>,
+    pub to: Vec<u8>,
+    pub size: Size,
+    pub anim: Anim,
 }
 
 /// Where an output's wallpaper currently stands.
@@ -240,6 +270,10 @@ impl DaemonState {
                 sharp: None,
                 blurred: None,
                 buffers_size: None,
+                showing: Showing::Sharp,
+                transition: None,
+                frame_pending: false,
+                generation: 0,
             },
         );
     }
@@ -325,14 +359,16 @@ impl DaemonState {
     /// the worker (and a colour placeholder is shown until the first result
     /// lands, so the surface maps immediately).
     ///
-    /// `token` is `0` for a plain repaint (configure / scale / hotplug /
-    /// reload) or a `set` token when the reply is deferred on the result.
+    /// Instant repaint — configure / scale / hotplug.
     pub(super) fn repaint(&mut self, id: &ObjectId) {
-        self.repaint_tagged(id, 0);
+        self.repaint_tagged(id, 0, true);
     }
 
-    pub(super) fn repaint_tagged(&mut self, id: &ObjectId, token: u64) {
-        let Some(entry) = self.wl.outputs.get(id) else {
+    /// `token` is `0` for a plain repaint or a `set` token when the reply is
+    /// deferred on the result. `instant` skips the crossfade (first paint,
+    /// scale change, `--no-fade`, `transition_ms = 0`).
+    pub(super) fn repaint_tagged(&mut self, id: &ObjectId, token: u64, instant: bool) {
+        let Some(entry) = self.wl.outputs.get_mut(id) else {
             return;
         };
         if !entry.configured {
@@ -345,48 +381,51 @@ impl DaemonState {
             return;
         }
 
+        // Snapshot everything we need, then release the borrow.
+        let resolved = entry.resolved.clone();
+        let name = entry.name.clone();
+        let first_paint = entry.status == PaintStatus::Pending;
+        entry.generation += 1;
+        let generation = entry.generation;
+
         let (radius, dim) = (self.config.blur.radius, self.config.blur.dim);
 
-        match entry.resolved.path.clone() {
+        match resolved.path {
             None => {
-                let color = entry.resolved.color;
-                let name = entry.name.clone();
-                // Colour source: build both buffers inline, retain, present.
+                let color = resolved.color;
                 if let Some(e) = self.wl.outputs.get_mut(id) {
                     e.sharp = Some(render::solid(color, phys));
                     e.blurred = Some(render::solid(color.dimmed(dim), phys));
                     e.buffers_size = Some(phys);
                 }
-                self.present(id);
+                self.present_target(id, instant);
                 self.note_result(token, &name, None);
             }
             Some(path) => {
-                let first_paint = entry.status == PaintStatus::Pending;
-                let color = entry.resolved.color;
-                let mode = entry.resolved.mode;
-                let name = entry.name.clone();
                 tracing::trace!(output = %name, first_paint, ?phys, "queueing image job");
                 if first_paint {
                     // Show the fill colour immediately so the surface maps;
                     // the image swaps in when the worker returns.
-                    self.commit_pixels(id, &render::solid(color, phys), phys);
+                    self.commit_pixels(id, &render::solid(resolved.color, phys), phys);
                 }
                 self.worker.submit(super::worker::Job {
                     token,
+                    generation,
                     output: name,
                     target: phys,
                     path,
-                    mode,
-                    fill: color,
+                    mode: resolved.mode,
+                    fill: resolved.color,
                     blur_radius: radius,
                     blur_dim: dim,
+                    fade: !instant,
                 });
             }
         }
     }
 
-    /// Overview opened or closed: swap every output's wallpaper between its
-    /// sharp and blurred buffer. No fade in M2 (M3 adds the crossfade).
+    /// Overview opened or closed: crossfade every output between its sharp
+    /// and blurred buffer.
     pub(super) fn set_overview_open(&mut self, open: bool) {
         if self.overview_open == open {
             return;
@@ -398,14 +437,14 @@ impl DaemonState {
         }
         let ids: Vec<ObjectId> = self.wl.outputs.keys().cloned().collect();
         for id in ids {
-            self.present(&id);
+            self.present_target(&id, false);
         }
     }
 
-    /// Present the buffer that matches the current overview state — blurred
-    /// when the overview is open and blur is enabled, else sharp — falling
-    /// back to sharp whenever the blurred buffer is not (yet) available.
-    fn present(&mut self, id: &ObjectId) {
+    /// Show the buffer that matches the current overview state — blurred when
+    /// the overview is open and blur is enabled, else sharp. `instant`
+    /// commits it directly; otherwise start (or retarget) a crossfade.
+    fn present_target(&mut self, id: &ObjectId, instant: bool) {
         let Some(entry) = self.wl.outputs.get(id) else {
             return;
         };
@@ -413,15 +452,81 @@ impl DaemonState {
             return;
         };
         let want_blur = self.overview_open && self.config.blur.enable;
-        let buf = match (want_blur, &entry.blurred, &entry.sharp) {
-            (true, Some(b), _) => b.clone(),
-            (_, _, Some(s)) => s.clone(),
-            _ => return,
+        let (target, showing) = match (want_blur, &entry.blurred, &entry.sharp) {
+            (true, Some(b), _) => (b.clone(), Showing::Blurred),
+            (_, _, Some(s)) => (s.clone(), Showing::Sharp),
+            _ => return, // nothing composited yet
         };
-        self.commit_pixels(id, &buf, size);
+
+        let dur = Duration::from_millis(u64::from(self.config.transition_ms));
+        let current = self.current_displayed(id);
+        let can_fade =
+            !instant && !dur.is_zero() && current.len() == target.len() && !current.is_empty();
+
+        if !can_fade {
+            if let Some(e) = self.wl.outputs.get_mut(id) {
+                e.transition = None;
+                e.showing = showing;
+            }
+            self.commit_pixels(id, &target, size);
+            return;
+        }
+
+        let first = render::blend(&current, &target, 0.0);
+        if let Some(e) = self.wl.outputs.get_mut(id) {
+            tracing::debug!(output = %e.name, ?showing, ms = dur.as_millis(), "crossfade start");
+            e.showing = showing;
+            e.transition = Some(Transition {
+                from: current,
+                to: target,
+                size,
+                anim: Anim::new(dur),
+            });
+        }
+        self.commit_pixels(id, &first, size); // re-requests a frame while a transition is live
     }
 
-    /// Copy `pixels` (BGRA, `size`) into a fresh shm slot and present it.
+    /// The exact pixels currently on screen for `id` (a mid-fade blend, or a
+    /// clone of the shown buffer). Empty if nothing is composited yet.
+    fn current_displayed(&self, id: &ObjectId) -> Vec<u8> {
+        let Some(entry) = self.wl.outputs.get(id) else {
+            return Vec::new();
+        };
+        if let Some(tr) = &entry.transition {
+            return render::blend(&tr.from, &tr.to, tr.anim.eased());
+        }
+        match entry.showing {
+            Showing::Blurred => entry.blurred.clone().unwrap_or_default(),
+            Showing::Sharp => entry.sharp.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Advance one crossfade a frame (called from the frame callback).
+    fn advance_transition(&mut self, id: &ObjectId) {
+        let Some(entry) = self.wl.outputs.get(id) else {
+            return;
+        };
+        let Some(tr) = &entry.transition else {
+            return;
+        };
+        let done = tr.anim.done();
+        let size = tr.size;
+        let pixels = if done {
+            tr.to.clone()
+        } else {
+            render::blend(&tr.from, &tr.to, tr.anim.eased())
+        };
+        tracing::trace!(t = tr.anim.eased(), done, "crossfade frame");
+        if done {
+            if let Some(e) = self.wl.outputs.get_mut(id) {
+                e.transition = None;
+            }
+        }
+        self.commit_pixels(id, &pixels, size);
+    }
+
+    /// Copy `pixels` (BGRA, `size`) into a fresh shm slot and present it. If
+    /// a crossfade is live, also requests the next frame callback.
     fn commit_pixels(&mut self, id: &ObjectId, pixels: &[u8], size: Size) {
         let Some(entry) = self.wl.outputs.get(id) else {
             return;
@@ -440,6 +545,10 @@ impl DaemonState {
                 .max(1)
         };
         let stride = size.w as i32 * 4;
+        // Surface geometry (opaque region, buffer scale, viewport dest) only
+        // changes when the size does — skip re-sending it every crossfade
+        // frame.
+        let geometry_changed = entry.painted != Some(size);
 
         let buffer = match self.wl.pool.create_buffer(
             size.w as i32,
@@ -462,30 +571,49 @@ impl DaemonState {
             }
         };
 
-        let opaque = Region::new(&self.wl.compositor).ok();
-        if let Some(r) = &opaque {
-            r.add(0, 0, lw as i32, lh as i32);
-            surface.set_opaque_region(Some(r.wl_region()));
-        }
-        surface.set_buffer_scale(buffer_scale);
-        if use_viewport {
-            if let Some(vp) = &viewport {
-                vp.set_destination(lw as i32, lh as i32);
+        let opaque = if geometry_changed {
+            let r = Region::new(&self.wl.compositor).ok();
+            if let Some(r) = &r {
+                r.add(0, 0, lw as i32, lh as i32);
+                surface.set_opaque_region(Some(r.wl_region()));
             }
-        }
+            surface.set_buffer_scale(buffer_scale);
+            if use_viewport {
+                if let Some(vp) = &viewport {
+                    vp.set_destination(lw as i32, lh as i32);
+                }
+            }
+            r
+        } else {
+            None
+        };
+
         if let Err(e) = buffer.attach_to(&surface) {
             tracing::error!(error = ?e, "attaching buffer");
             return;
         }
         surface.damage_buffer(0, 0, size.w as i32, size.h as i32);
-        surface.commit();
 
-        if let Some(e) = self.wl.outputs.get_mut(id) {
-            e._opaque_region = opaque;
+        // While a crossfade is live, ask for the next frame callback *before*
+        // committing so the request is latched with this commit.
+        let want_frame = if let Some(e) = self.wl.outputs.get_mut(id) {
+            if geometry_changed {
+                e._opaque_region = opaque;
+            }
             e.painted = Some(size);
             e.status = PaintStatus::Painted;
-            tracing::debug!(output = %e.name, w = size.w, h = size.h, "committed wallpaper");
+            let want = e.transition.is_some() && !e.frame_pending;
+            if want {
+                e.frame_pending = true;
+            }
+            want
+        } else {
+            false
+        };
+        if want_frame {
+            surface.frame(&self.wl.qh, FrameCallbackData(surface.clone()));
         }
+        surface.commit();
     }
 
     /// Apply one finished [`worker::JobResult`].
@@ -497,15 +625,20 @@ impl DaemonState {
             .find(|(_, e)| e.name == result.output)
             .map(|(id, _)| id.clone());
 
+        let fresh = id
+            .as_ref()
+            .and_then(|id| self.wl.outputs.get(id))
+            .is_some_and(|e| e.generation == result.generation);
+
         let error = match result.outcome {
             Ok(rendered) => match &id {
-                Some(id) if self.output_wants(id, rendered.size) => {
+                Some(id) if fresh => {
                     if let Some(e) = self.wl.outputs.get_mut(id) {
                         e.buffers_size = Some(rendered.size);
                         e.sharp = Some(rendered.sharp);
                         e.blurred = Some(rendered.blurred);
                     }
-                    self.present(id);
+                    self.present_target(id, !result.fade);
                     None
                 }
                 Some(_) => {
@@ -529,16 +662,6 @@ impl DaemonState {
         };
 
         self.note_result(result.token, &result.output, error);
-    }
-
-    /// Whether a render of `size` still matches what output `id` currently
-    /// needs (its source is still an image and the physical size is
-    /// unchanged). A cheap staleness guard until M3's generation counter.
-    fn output_wants(&self, id: &ObjectId, size: Size) -> bool {
-        self.wl
-            .outputs
-            .get(id)
-            .is_some_and(|e| e.resolved.path.is_some() && e.physical() == Some(size))
     }
 
     /// Build `niribg get`'s payload from the live output list plus any
@@ -614,6 +737,7 @@ impl DaemonState {
     /// nothing connected to paint (the change is still stored).
     pub(super) fn set_wallpaper(&mut self, req: SetRequest) -> SetDispatch {
         let slot = req.slot.unwrap_or_else(|| DEFAULT_SLOT.to_string());
+        let instant = !req.fade;
         let patch = OutputConfig {
             path: req.path,
             mode: req.mode,
@@ -669,7 +793,7 @@ impl DaemonState {
                     }
                 }
             }
-            self.repaint_tagged(&id, token);
+            self.repaint_tagged(&id, token, instant);
         }
         SetDispatch::Deferred(token)
     }
@@ -711,7 +835,7 @@ impl DaemonState {
                 _ => false,
             };
             if repaint {
-                self.repaint(&id);
+                self.repaint_tagged(&id, 0, false); // reload changes crossfade
             }
         }
         Ok(changed)
@@ -791,10 +915,15 @@ impl CompositorHandler for DaemonState {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &WlSurface,
+        surface: &WlSurface,
         _time: u32,
     ) {
-        // Animations arrive in M3.
+        if let Some(id) = self.entry_id_for_surface(surface) {
+            if let Some(e) = self.wl.outputs.get_mut(&id) {
+                e.frame_pending = false;
+            }
+            self.advance_transition(&id);
+        }
     }
 
     fn surface_enter(

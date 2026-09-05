@@ -4,11 +4,11 @@ Wallpaper daemon for the [niri](https://github.com/YaLTeR/niri) Wayland
 compositor, with **blur on overview**: your wallpaper is sharp while you work
 and fades to a blurred, dimmed backdrop whenever niri's overview is open.
 
-> Status: early. **M2 done** — `niribg daemon` draws per-output colour and
-> image wallpapers on niri (correct fractional scaling, hotplug,
-> `set` / `reload` / `reset`) and swaps to a blurred, dimmed backdrop while
-> niri's overview is open. Transitions/crossfade (M3) are next. See
-> [`DESIGN.md`](DESIGN.md) for the plan and milestones.
+> Status: **feature-complete (M3 done)** — `niribg daemon` draws per-output
+> colour and image wallpapers on niri (fractional scaling, hotplug,
+> `set` / `reload` / `reset`) and **crossfades** to a blurred, dimmed backdrop
+> while niri's overview is open. `transition_ms` / `--no-fade` control the
+> fade. M4 is packaging and release polish. See [`DESIGN.md`](DESIGN.md).
 
 ## Why
 

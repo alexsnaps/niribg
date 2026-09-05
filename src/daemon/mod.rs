@@ -7,6 +7,7 @@
 //! channel. Heavy image work runs on one worker thread; nothing else leaves
 //! the loop.
 
+pub mod anim;
 pub mod ipc;
 mod niri;
 pub mod render;

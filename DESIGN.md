@@ -387,10 +387,11 @@ Each is independently testable.
   niri replays state on connect). Downscale ×¼ → 3× box blur → upscale + dim,
   eager on the worker (both buffers per job). Overview event → instant
   sharp↔blurred swap (no fade yet). **→ blur follows overview.** (See §14.)
-- **M3 — Transitions.** `anim.rs` (interruptible lerp), frame-callback
-  crossfade compositor sharp↔blurred, 250 ms. Reused for `set` swap
-  (`--no-fade`). Generation counter for rapid `set`. **→ feature-complete
-  v1.**
+- **M3 — Transitions. ✅ done.** `anim.rs` (timed ease-out cubic),
+  frame-callback crossfade `blend(from, to, t)` with snapshot-on-retarget,
+  250 ms. Reused for `set` swap and `reload` changes (`--no-fade` /
+  `transition_ms=0` snap). Per-output generation counter for rapid `set`.
+  **→ feature-complete v1.** (See §15.)
 - **M4 — Release.** Full `get` (human + JSON), `--replace`, `TESTING.md`
   pass, golden tests, `clap_mangen` man page, `contrib/niribg.service`,
   `examples/config.toml`, `CHANGELOG`, cargo-dist, tag `0.1.0`, publish to
@@ -740,3 +741,115 @@ Carried forward:
 - **`box_blur_3x` allocates a scratch `Vec<f32>` per output per render** —
   fine at M2's cadence; pool it if M3's per-frame path ever needs it (it
   won't — M3 blends the two finished `u8` buffers, no re-blur).
+
+---
+
+## 15. M3 implementation notes
+
+Decisions from the M3 design pass. Refines §3 (the transition primitive).
+
+niri has **no compositor-side alpha** (`wp_alpha_modifier_v1` absent), so the
+crossfade is a CPU per-byte blend into a fresh shm buffer.
+
+### The primitive
+
+One `Transition` per output, `Option`, `None` when idle:
+
+```rust
+struct Transition { from: Vec<u8>, to: Vec<u8>, size: Size, anim: Anim }
+```
+
+Displayed pixels = `render::blend(from, to, anim.eased())`, blended each
+frame. **Every retarget snapshots**: `from ← <current displayed pixels,
+cloned or blended once>`, `to ← <new target buffer, cloned>`, timer
+restarts. Blur open / close / `set` / `reload`-change are all the same code
+path — only `to` differs. On `anim.done()`: commit `to` exactly, drop the
+`Transition`, go idle (zero-redraw steady state, as M1/M2).
+
+`from`/`to` are owned `Vec<u8>` (≈2×20 MB cloned per transition start;
+transitions happen ~1/sec at most).
+
+### `anim.rs`
+
+Minimal, timing only — interruption is the caller replacing the whole
+`Transition`.
+
+```rust
+pub struct Anim { start: Instant, duration: Duration }
+Anim::new(duration) · progress() -> f32 (0..=1) · eased() -> f32
+  (ease-out cubic, 1-(1-p)^3) · done() -> bool
+```
+
+`duration` from `config.transition_ms`; `0` never builds an `Anim` (instant
+path).
+
+### Driving it
+
+- **Retarget:** build `Transition`, blend+commit frame 0 synchronously,
+  `surface.frame(qh, FrameCallbackData(surface.clone()))`. Per-output
+  `frame_pending: bool` so callbacks never stack.
+- **`CompositorHandler::frame`:** match surface → entry, clear
+  `frame_pending`. If it has a `Transition`: `t = anim.eased()` from a
+  wall-clock `Instant` (the compositor `time` arg is ignored — the eased
+  timer self-corrects if frames drop). Blend → commit. `t < 1` → request
+  another frame; `t ≥ 1` → commit `to` exactly, drop the `Transition`.
+- **Idle** → no frame requested.
+- `set_overview_open` / `apply_rendered` / `repaint_tagged` call
+  `present_target(id, instant: bool)` instead of `present()`. `instant`
+  commits directly (M2 behaviour); otherwise start/retarget the
+  `Transition`.
+
+### What fades
+
+Overview open/close · `set` (unless `--no-fade`) · `reload`/`reset` changed
+outputs. **Not**: first paint (nothing to fade from), scale/resolution
+change (snap), `transition_ms = 0` (global instant).
+
+### Generation counter
+
+`OutputEntry.generation: u64`, bumped in `repaint_tagged` before each job
+submit. `worker::Job` / `worker::JobResult` carry it. `apply_rendered`
+discards buffers whose `generation != entry.generation` (still calls
+`note_result` so the deferred `set` reply resolves). Replaces the
+`output_wants` size check. `token` routes the reply; `generation` decides
+whose pixels win — separate concerns.
+
+### M3 build order
+
+1. `anim.rs` + `render::blend()`. Pure + tests.
+2. `Transition` + `present_target(id, instant)`; `OutputEntry` gains
+   `transition` / `frame_pending` / `generation`; frame-callback loop in
+   `CompositorHandler::frame`.
+3. Generation counter through `Job`/`JobResult`; drop `output_wants`.
+4. `--no-fade` threaded through `set_wallpaper`; first-paint / scale-change
+   pass `instant=true`; `TESTING.md` manual pass.
+
+### Tests
+
+`render::blend` (t=0→a, t=1→b, t=0.5→midpoint ±1, length, clamp) · `anim`
+(eased/progress/done at 0, mid, past-end via `Instant` arithmetic). No golden
+PNGs — the blur pipeline has statistical tests; the crossfade's testable
+core is `blend` + `anim`; the visual is a `TESTING.md` check.
+
+### M3 status — done
+
+Verified on niri 26.04: overview open/close crossfades ~7 frames over 250 ms
+with a visible ease-out curve; `set` fades placeholder→image; `set
+--no-fade` and `transition_ms=0` snap; `reload` changes fade; fast overview
+toggle (open then close ~90 ms in) retargets from the mid-fade blend with no
+jump; rapid `set A; set B` → B wins, A's late render logged "discarding stale
+render". `blur.enable=false` → zero crossfades on toggle. Failure paths and
+M1/M2 behaviour unchanged. 84 unit tests; clippy + fmt clean.
+
+Carried forward:
+
+- **`commit_pixels` only re-sends surface geometry (opaque region, buffer
+  scale, viewport dest) when the size changed** — a 15-frame fade no longer
+  churns 15 throwaway `wl_region` objects.
+- **`render::blend` `vec![0u8; n]` then overwrites** (~2–3 ms of the
+  ~6–8 ms/frame budget at 2880×1800). `wide`/SIMD or `spare_capacity_mut` is
+  the win if 4K users report choppiness; the eased wall-clock timer already
+  makes dropped frames a non-issue for *timing*.
+- **Frame callbacks arrive at ~30 Hz here**, not 60 — niri's pacing for a
+  background-layer surface. 7 frames / 250 ms still reads as a smooth fade;
+  not worth chasing.

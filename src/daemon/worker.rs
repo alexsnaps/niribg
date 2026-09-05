@@ -24,6 +24,9 @@ pub const MAX_PIXELS: u64 = 100_000_000;
 /// Colour-only wallpapers never reach the worker.
 pub struct Job {
     pub token: u64,
+    /// The output's render generation when this job was queued; a result
+    /// whose generation is stale by the time it lands is dropped.
+    pub generation: u64,
     pub output: String,
     pub target: Size,
     pub path: PathBuf,
@@ -35,6 +38,8 @@ pub struct Job {
     pub blur_radius: u32,
     /// How much to darken the blurred backdrop, `0.0..=0.5`.
     pub blur_dim: f64,
+    /// Crossfade to the result rather than snapping.
+    pub fade: bool,
 }
 
 /// A finished render. Both buffers are `Xrgb8888` BGRA at `size`, stride
@@ -51,7 +56,9 @@ pub struct Rendered {
 /// route it back to the right output and pending `set`.
 pub struct JobResult {
     pub token: u64,
+    pub generation: u64,
     pub output: String,
+    pub fade: bool,
     pub outcome: Result<Rendered, String>,
 }
 
@@ -101,6 +108,7 @@ fn worker_loop(rx: &Receiver<Job>, results: &calloop::channel::Sender<JobResult>
     while let Ok(job) = rx.recv() {
         let Job {
             token,
+            generation,
             output,
             target,
             path,
@@ -108,13 +116,16 @@ fn worker_loop(rx: &Receiver<Job>, results: &calloop::channel::Sender<JobResult>
             fill,
             blur_radius,
             blur_dim,
+            fade,
         } = job;
         let outcome = render_image(&path, mode, fill, target, blur_radius, blur_dim)
             .map_err(|e| format!("{e:#}"));
         if results
             .send(JobResult {
                 token,
+                generation,
                 output,
+                fade,
                 outcome,
             })
             .is_err()
@@ -189,6 +200,7 @@ mod tests {
     fn job(token: u64, path: PathBuf, target: Size, mode: Mode) -> Job {
         Job {
             token,
+            generation: token,
             output: "o".into(),
             target,
             path,
@@ -196,6 +208,7 @@ mod tests {
             fill: Color::BLACK,
             blur_radius: 8,
             blur_dim: 0.15,
+            fade: false,
         }
     }
 

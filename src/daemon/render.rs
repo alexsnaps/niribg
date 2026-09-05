@@ -241,6 +241,30 @@ fn blit_over(out: &mut [u8], out_size: Size, fg: &RgbaImage, ox: u32, oy: u32, f
     }
 }
 
+// --- crossfade (M3) ---------------------------------------------------
+
+/// Per-byte linear blend `(1 − t)·a + t·b` of two BGRA buffers, `t` clamped
+/// to `0.0..=1.0`. `t == 0` returns a copy of `a`, `t == 1` a copy of `b`.
+/// The result is `min(a.len(), b.len())` bytes.
+#[must_use]
+pub fn blend(a: &[u8], b: &[u8], t: f32) -> Vec<u8> {
+    let n = a.len().min(b.len());
+    if t <= 0.0 {
+        return a[..n].to_vec();
+    }
+    if t >= 1.0 {
+        return b[..n].to_vec();
+    }
+    // 0..=256 fixed point so the common endpoints are exact.
+    let tb = (t * 256.0) as u32;
+    let ta = 256 - tb;
+    let mut out = vec![0u8; n];
+    for ((o, &x), &y) in out.iter_mut().zip(&a[..n]).zip(&b[..n]) {
+        *o = ((u32::from(x) * ta + u32::from(y) * tb) >> 8) as u8;
+    }
+    out
+}
+
 // --- blur pipeline (M2) -------------------------------------------------
 
 /// Factor the blur pipeline downscales by before blurring. The blur radius is
@@ -716,5 +740,53 @@ mod tests {
     fn blur_dim_degenerate_size_is_a_copy() {
         let sharp = flat(4, 4, 50);
         assert_eq!(blur_dim(&sharp, Size::new(0, 4), 5, 0.2), sharp);
+    }
+
+    // --- crossfade ---
+
+    #[test]
+    fn blend_endpoints_are_exact() {
+        let a = flat(4, 4, 10);
+        let b = flat(4, 4, 200);
+        assert_eq!(blend(&a, &b, 0.0), a);
+        assert_eq!(blend(&a, &b, 1.0), b);
+        // clamped
+        assert_eq!(blend(&a, &b, -3.0), a);
+        assert_eq!(blend(&a, &b, 5.0), b);
+    }
+
+    #[test]
+    fn blend_midpoint_is_the_average() {
+        let a = flat(8, 4, 40);
+        let b = flat(8, 4, 200);
+        for &v in &blend(&a, &b, 0.5) {
+            assert!((119..=121).contains(&v), "midpoint {v}");
+        }
+    }
+
+    #[test]
+    fn blend_is_monotone_per_byte() {
+        let a = vec![0u8, 50, 150, 255];
+        let b = vec![255u8, 200, 100, 0];
+        let mut prev = a.clone();
+        for step in 1..=10 {
+            let t = step as f32 / 10.0;
+            let cur = blend(&a, &b, t);
+            for i in 0..4 {
+                let toward_b = if b[i] >= a[i] {
+                    cur[i] >= prev[i]
+                } else {
+                    cur[i] <= prev[i]
+                };
+                assert!(toward_b, "byte {i} not moving toward b at t={t}");
+            }
+            prev = cur;
+        }
+        assert_eq!(blend(&a, &b, 1.0), b);
+    }
+
+    #[test]
+    fn blend_length_is_the_shorter_input() {
+        assert_eq!(blend(&flat(4, 4, 1), &flat(2, 4, 2), 0.3).len(), 2 * 4 * 4);
     }
 }
