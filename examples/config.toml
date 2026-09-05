@@ -1,14 +1,15 @@
 # Example niribg config. Copy to ~/.config/niribg/config.toml and edit.
 # Every key is optional; the values shown are the built-in defaults unless
-# noted. See DESIGN.md §6 for the full reference.
+# noted. Full reference: the "Configuration" section of the README.
 
-# Crossfade duration for blur toggles and wallpaper swaps. 0 = instant.
+# Crossfade duration for blur toggles and wallpaper swaps, in milliseconds.
+# 0 disables all fades.
 transition_ms = 250
 
 [blur]
 # When false, niribg is only a wallpaper daemon (no blur on overview).
 enable = true
-# Stack-blur radius, in physical pixels at the downscaled resolution.
+# Box-blur radius, applied at 1/4 resolution — 30 is a heavy, dreamy blur.
 radius = 30
 # How much to darken the blurred backdrop, 0.0..=0.5.
 dim = 0.15

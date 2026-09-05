@@ -853,3 +853,78 @@ Carried forward:
 - **Frame callbacks arrive at ~30 Hz here**, not 60 — niri's pacing for a
   background-layer surface. 7 frames / 250 ms still reads as a smooth fade;
   not worth chasing.
+
+---
+
+## 16. M4 implementation notes
+
+Release polish — docs + packaging, no daemon logic.
+
+### Dependency trim
+
+`smithay-client-toolkit = { version = "0.21", default-features = false,
+features = ["calloop", "calloop-wayland-source"] }` — drops `xkbcommon` (and
+`bytemuck_derive`). We never run seat/keyboard code
+(`KeyboardInteractivity::None`, no `SeatState`), so `xkbcommon`'s runtime
+`dlopen("libxkbcommon.so")` path was dead anyway. Result: no C link deps
+(`objdump -p` NEEDED = libgcc_s, libm, libc), a smaller tree, and a clean
+musl static build.
+
+### Man page & completions
+
+`build.rs` uses `clap_mangen` + `clap_complete` (build-deps) to write
+`niribg.1` and bash/zsh/fish completions into `$OUT_DIR`, and prints the
+path. The `clap` `Parser` structs live in `src/cli.rs`
+(`pub fn command() -> clap::Command`), shared by `main.rs` and, via
+`#[path = "src/cli.rs"] mod cli;`, by `build.rs`. `cargo install` doesn't
+install these; distro packaging picks them out of `OUT_DIR` (the `ripgrep`
+pattern).
+
+### Packaging
+
+`cargo-dist` (`[workspace.metadata.dist]`, pinned version): targets
+`x86_64-unknown-linux-gnu` + `-musl`; a tarball per target holding the binary
++ `niribg.1` + completions + `LICENSE` + `README.md` + `examples/config.toml`
++ `contrib/niribg.service`; the hosted `shell` installer. A `v*` tag triggers
+`.github/workflows/release.yml` → GitHub Release. **`cargo publish` to
+crates.io is manual**, after the tag build is green.
+
+### Docs
+
+Everything in `README.md` (what/why · install · quickstart · full config
+reference · full CLI reference · vs `swaybg`/`swww`/`mpvpaper` ·
+troubleshooting). Plus `TESTING.md` (the consolidated manual checklist),
+`CHANGELOG.md` (keep-a-changelog, `[0.1.0] – unreleased`),
+`contrib/niribg.service` (user unit, `Type=simple`, `Restart=on-failure`,
+`graphical-session.target`), refreshed `examples/config.toml`.
+
+### Golden-image tests
+
+Still **not** done (grill decision at M2) — the blur pipeline has statistical
+tests, the crossfade's core is `blend` + `anim` unit tests, and the visual is
+a `TESTING.md` item. The M4 milestone bullet's mention of them is superseded.
+
+### M4 build order
+
+1. Extract `src/cli.rs` (shared `command()`); `main.rs` re-uses it.
+2. `build.rs` → `niribg.1` + completions into `$OUT_DIR`.
+3. README rewrite + `TESTING.md` + `CHANGELOG.md` + `contrib/niribg.service`
+   + refresh `examples/config.toml`; run the checklist on niri.
+4. `[workspace.metadata.dist]` + `release.yml` + Cargo.toml metadata polish.
+
+### Releasing (runbook)
+
+1. `cargo dist init` (once, and after any `[workspace.metadata.dist]` change)
+   → generates/refreshes `.github/workflows/release.yml`. Commit it.
+2. Update `CHANGELOG.md`: rename `[0.1.0] – unreleased` to a dated release.
+3. `cargo test && cargo clippy --all-targets && cargo fmt --check &&
+   cargo publish --dry-run` — all green.
+4. Work the `TESTING.md` checklist on a real niri session.
+5. `git tag v0.1.0 && git push origin v0.1.0` → the release workflow builds
+   gnu + musl tarballs and cuts the GitHub Release with the shell installer.
+6. `cargo publish` (needs a crates.io token) once the tag build is green.
+
+`cargo install` users get no man page / completions (cargo installs neither);
+distro packagers regenerate them from `build.rs`'s `OUT_DIR` output. The
+release tarballs carry the static docs listed in `[package.metadata.dist]
+include`.

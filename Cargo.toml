@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2024"
 description = "Wallpaper daemon for the niri Wayland compositor, with blur on overview"
 repository = "https://github.com/alexsnaps/niribg"
+homepage = "https://github.com/alexsnaps/niribg"
 license = "Apache-2.0"
 keywords = ["niri", "wayland", "wallpaper", "layer-shell"]
 categories = ["command-line-utilities"]
 readme = "README.md"
 rust-version = "1.85"
+exclude = [".github/", "TESTING.md", "DESIGN.md"]
 
 [dependencies]
 anyhow = "1"
@@ -25,12 +27,19 @@ image = { version = "0.25", default-features = false, features = [
 niri-ipc = "26.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-smithay-client-toolkit = "0.21"
+smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop", "calloop-wayland-source"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+
+[build-dependencies]
+# `build.rs` compiles `src/cli.rs` (clap derive) to emit the man page and
+# shell completions.
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
 
 [profile.release]
 panic = "abort"
@@ -40,3 +49,18 @@ lto = "thin"
 [lints.clippy]
 # keep CI honest; opt into the pedantic lints we actually want later
 all = { level = "warn", priority = -1 }
+
+# Extra files bundled into the release tarballs. The generated man page and
+# shell completions live in OUT_DIR (see build.rs) and are not listed here.
+[package.metadata.dist]
+include = ["LICENSE", "README.md", "CHANGELOG.md", "examples/config.toml", "contrib/niribg.service"]
+
+# `cargo dist init` reads this and (re)generates .github/workflows/release.yml.
+# Pin the version so CI is reproducible; bump deliberately.
+[workspace.metadata.dist]
+cargo-dist-version = "0.28.0"
+ci = "github"
+installers = ["shell"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+install-updater = false
+pr-run-mode = "plan"

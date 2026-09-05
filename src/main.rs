@@ -1,11 +1,13 @@
 //! `niribg` command-line entry point: parse args, set up logging, then either
 //! run the daemon or send one command to a running one.
 
+mod cli;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::Parser;
 use niribg::client;
 use niribg::color::Color;
 use niribg::config::Mode;
@@ -13,70 +15,7 @@ use niribg::daemon;
 use niribg::paths;
 use niribg::proto::{Request, Status, WireReply};
 
-#[derive(Parser)]
-#[command(name = "niribg", version, about, arg_required_else_help = true)]
-struct Cli {
-    /// Path to config.toml (default: $XDG_CONFIG_HOME/niribg/config.toml).
-    #[arg(long, global = true, value_name = "PATH")]
-    config: Option<PathBuf>,
-
-    /// Control socket path (default: $XDG_RUNTIME_DIR/niribg-$WAYLAND_DISPLAY.sock).
-    #[arg(long, global = true, value_name = "PATH")]
-    socket: Option<PathBuf>,
-
-    /// Increase log verbosity: -v = debug, -vv = trace.
-    #[arg(short, long, global = true, action = ArgAction::Count)]
-    verbose: u8,
-
-    /// Only log warnings and errors.
-    #[arg(short, long, global = true, conflicts_with = "verbose")]
-    quiet: bool,
-
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Run the long-lived wallpaper daemon (foreground).
-    Daemon {
-        /// Take over from an already-running daemon.
-        #[arg(long)]
-        replace: bool,
-    },
-    /// Set a wallpaper image, or a solid colour, on one output or the default slot.
-    Set {
-        /// Image file. Omit to set a solid colour with --color.
-        path: Option<PathBuf>,
-        /// Output connector name (default: the shared `default` slot).
-        #[arg(long, value_name = "NAME")]
-        output: Option<String>,
-        /// Fit mode.
-        #[arg(long, value_name = "MODE")]
-        mode: Option<Mode>,
-        /// Fill / letterbox colour, e.g. #1e1e2e. Used alone if no path is given.
-        #[arg(long, value_name = "HEX")]
-        color: Option<Color>,
-        /// Swap instantly instead of crossfading.
-        #[arg(long = "no-fade")]
-        no_fade: bool,
-        /// Do not persist this change to state.json.
-        #[arg(long = "no-persist")]
-        no_persist: bool,
-    },
-    /// Print daemon and per-output status.
-    Get {
-        /// Emit JSON instead of a human table.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Re-read config.toml from disk and re-apply.
-    Reload,
-    /// Clear state.json and revert to config.toml.
-    Reset,
-    /// Ask the daemon to exit cleanly.
-    Quit,
-}
+use cli::{Cli, Command};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -147,8 +86,8 @@ fn run_simple(cli: &Cli, cmd: &Command) -> Result<()> {
         } => Request::Set {
             path: path.as_deref().map(to_abs_string),
             output: output.clone(),
-            mode: *mode,
-            color: *color,
+            mode: mode.as_deref().map(str::parse::<Mode>).transpose()?,
+            color: color.as_deref().map(str::parse::<Color>).transpose()?,
             fade: !no_fade,
             persist: !no_persist,
         },

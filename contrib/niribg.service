@@ -1,0 +1,26 @@
+# systemd user unit for niribg.
+#
+#   install -Dm644 contrib/niribg.service ~/.config/systemd/user/niribg.service
+#   systemctl --user enable --now niribg.service
+#
+# Use this OR `spawn-at-startup "niribg" "daemon"` in your niri config, not
+# both. Requires a `graphical-session.target` that niri's session pulls in
+# (niri-session does).
+
+[Unit]
+Description=Wallpaper daemon for niri, with blur on overview
+Documentation=https://github.com/alexsnaps/niribg
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+# `env` resolves `niribg` on your PATH (works for ~/.cargo/bin and system
+# installs alike). Distro packagers may hardcode /usr/bin/niribg instead.
+ExecStart=/usr/bin/env niribg daemon
+ExecReload=/usr/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=graphical-session.target
