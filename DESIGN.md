@@ -382,10 +382,11 @@ Each is independently testable.
   Hotplug. `set` → worker decode → commit (no fade). `state.json` +
   `--no-persist` + `reset`. **→ usable `swaybg` replacement.** (See §13 for
   the implementation notes and carried-forward items.)
-- **M2 — niri IPC + blur.** `niri-ipc` `calloop` source, backoff reconnect,
-  resync via `overview-state`. Downscale → stack blur → upscale + dim, eager
-  on the worker. Overview event → blur target 0/1 (snap, no fade yet).
-  **→ blur follows overview.**
+- **M2 — niri IPC + blur. ✅ done.** Raw `$NIRI_SOCKET` + niri-ipc *types* +
+  `calloop` `Generic` source, `Timer` backoff reconnect (no resync query —
+  niri replays state on connect). Downscale ×¼ → 3× box blur → upscale + dim,
+  eager on the worker (both buffers per job). Overview event → instant
+  sharp↔blurred swap (no fade yet). **→ blur follows overview.** (See §14.)
 - **M3 — Transitions.** `anim.rs` (interruptible lerp), frame-callback
   crossfade compositor sharp↔blurred, 250 ms. Reused for `set` swap
   (`--no-fade`). Generation counter for rapid `set`. **→ feature-complete
@@ -631,3 +632,111 @@ Carried forward:
   verified manually against niri. Revisit when `DaemonState` stabilises.
 - **`update_output`** is a no-op; `configure` + `preferred_scale` cover
   runtime resolution/scale changes.
+
+---
+
+## 14. M2 implementation notes
+
+Decisions from the M2 design pass. Refines §3–§4.
+
+### niri IPC — mechanism
+
+`niri-ipc` v26.4.0. Its `Socket` helper is **blocking-only with no fd
+accessor**, so we use only its `Event` / `Request` / `Reply` *types* and
+drive the socket ourselves:
+
+- Raw `UnixStream::connect($NIRI_SOCKET)` → write `"EventStream"\n` → read the
+  `{"Ok":"Handled"}` line → set non-blocking → register as a `calloop`
+  `Generic` source, newline-framed like the control socket, each line
+  `serde_json::from_str::<niri_ipc::Event>`.
+- Single-threaded. Clean shutdown = drop the source.
+- **No resync query.** niri replays full current state on every connect, so
+  the first `OverviewOpenedOrClosed` after `EventStream` sets the blur
+  target.
+- **Reconnect:** `calloop::timer::Timer`, exponential backoff 250 ms → ×2 →
+  cap 5 s, reset on a successful handshake. `$NIRI_SOCKET` missing → same
+  loop, one `info` log then quiet.
+- **On EOF / read error:** remove the source, `niri_connected = false`, blur
+  target → `false` (show sharp), schedule reconnect.
+
+### Blur pipeline
+
+`render::blur_dim(sharp_bgra, size, radius, dim) -> Vec<u8>` — pure:
+
+1. Downscale sharp **×¼**, box average.
+2. **Stack blur** the small buffer (hand-rolled, no dep). `blur.radius` is
+   applied at the **downscaled** resolution (default 30 ⇒ a heavy overview
+   backdrop).
+3. Bilinear upscale to full size.
+4. Multiply RGB by `(1 − dim)`; leave the X byte.
+
+The worker computes both buffers in one job:
+
+```rust
+Job     { …, blur: BlurParams { radius: u32, dim: f64 } }
+Rendered { size, sharp: Vec<u8>, blurred: Option<Vec<u8>> }
+```
+
+`blurred` is computed **whenever the source is an image** (≈1/16 the pixels
++ a down/upscale; tens of ms), so toggling `blur.enable` via `reload` is
+instant. A colour source's `blurred` is `render::solid(color × (1 − dim))`,
+built inline.
+
+### Applying the toggle (M2 = snap, no fade)
+
+- `DaemonState` gains `overview_open: bool`, `niri_connected: bool`.
+  `OutputEntry` gains `sharp: Option<Vec<u8>>`, `blurred: Option<Vec<u8>>`
+  (the last render's buffers, ≈41 MB/output at 2880×1800 — §9's budget; M3's
+  crossfade blends them).
+- `commit_pixels` splits: the attach/damage/commit half stays; `present(id)`
+  picks `overview_open && blur.enable && blurred.is_some() ? blurred : sharp`
+  and commits it.
+- `OverviewOpenedOrClosed` → set `overview_open`, `present` every connected
+  output.
+- Worker result → store both buffers, then `present(id)` (respects current
+  overview state).
+- `blur.enable = false` → IPC still connects and events still arrive (so
+  `niri_connected` / `blur.active` report truthfully); `present` always picks
+  sharp.
+- `niribg get`: `blur.active = overview_open && blur.enable`;
+  `niri_connected` real. Human line: `… — currently ON` / `off`.
+
+### M2 build order
+
+1. ✅ `render::blur_dim` + `downscale_avg` / `upscale_bilinear` /
+   `box_blur_3x` (f32 internally — integer truncation across 6 passes bled
+   ~84 % of the mass), `dim_in_place`. Pure + 9 tests.
+2. ✅ Worker returns `Rendered { sharp, blurred }`; `Job` carries
+   `blur_radius`/`blur_dim`; `OutputEntry` retains both buffers +
+   `buffers_size`; `present()` split from `commit_pixels`; colour source's
+   `blurred` = `solid(color.dimmed(dim))` inline.
+3. ✅ `daemon/niri.rs`: raw `$NIRI_SOCKET` connect, `"EventStream"` +
+   hand-read `{"Ok":"Handled"}` line (byte-at-a-time so no over-read),
+   non-blocking `Generic` source, `Timer` backoff reconnect,
+   `OverviewOpenedOrClosed` → `set_overview_open` → `present` every output.
+4. ✅ Polish: `set_overview_open` early-returns when `blur.enable=false` (no
+   wasteful re-commit); one `info` line on first IPC failure then quiet;
+   `check_handshake` / `overview_from_line` extracted + 4 parse tests.
+
+### M2 status — done
+
+Verified on niri 26.04: `niri: connected` on startup, initial
+`OverviewOpenedOrClosed` consumed without a spurious blur, overview
+open/close → instant sharp↔blurred swap for both image and colour
+wallpapers, `blur.enable=false` receives events but never swaps,
+`$NIRI_SOCKET` absent/bad → one info line + exponential-backoff retry while
+the wallpaper still works, `set`/`reload`/`reset` unaffected. 75 unit tests;
+clippy + fmt clean.
+
+Carried forward:
+
+- **Reconnect after niri actually restarts** (compositor exit) not manually
+  verified — would mean restarting the session. The EOF → `niri_lost` →
+  reconnect path is the same one the bad-socket retry test exercises.
+- **Worker time** for an image is now ~320 ms in release (Lanczos 4× upscale
+  + blur pipeline). Still fully off the loop; the placeholder colour shows
+  first. M3's crossfade covers the swap; `fast_image_resize` remains an
+  option.
+- **`box_blur_3x` allocates a scratch `Vec<f32>` per output per render** —
+  fine at M2's cadence; pool it if M3's per-frame path ever needs it (it
+  won't — M3 blends the two finished `u8` buffers, no re-blur).

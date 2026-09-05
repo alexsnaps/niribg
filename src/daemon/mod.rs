@@ -8,6 +8,7 @@
 //! the loop.
 
 pub mod ipc;
+mod niri;
 pub mod render;
 mod wayland;
 pub mod worker;
@@ -122,6 +123,9 @@ pub fn run(socket: &Path, config_path: Option<PathBuf>, replace: bool) -> Result
         )
         .map_err(|e| anyhow::anyhow!("registering signals: {e}"))?;
 
+    // Kick off the niri IPC connection (self-reconnecting via a timer).
+    state.niri_connect();
+
     tracing::info!(socket = %socket.display(), pid = std::process::id(), "niribg daemon listening");
     event_loop
         .run(None, &mut state, |_state| {})
@@ -152,6 +156,14 @@ struct DaemonState {
     wl: Wayland,
     /// The image-decode/compose worker thread.
     worker: worker::Worker,
+
+    /// Whether niri's overview is currently open (drives the blur swap).
+    overview_open: bool,
+    /// Whether the niri IPC event stream is currently connected.
+    niri_connected: bool,
+    /// Current niri IPC reconnect delay (grows on failure, resets on
+    /// connect).
+    niri_backoff: Duration,
 
     /// Effective config: `config.toml` overlaid with `state.json`.
     config: Config,
@@ -200,6 +212,9 @@ impl DaemonState {
             state: runtime_state,
             explicit_config,
             state_path,
+            overview_open: false,
+            niri_connected: false,
+            niri_backoff: niri::BACKOFF_MIN,
             next_token: 1,
             pending_sets: HashMap::new(),
         })

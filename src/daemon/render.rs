@@ -241,6 +241,159 @@ fn blit_over(out: &mut [u8], out_size: Size, fg: &RgbaImage, ox: u32, oy: u32, f
     }
 }
 
+// --- blur pipeline (M2) -------------------------------------------------
+
+/// Factor the blur pipeline downscales by before blurring. The blur radius is
+/// applied at this reduced resolution.
+pub const BLUR_DOWNSCALE: u32 = 4;
+
+/// Produce the blurred, dimmed backdrop for `sharp` (a `size` BGRA buffer):
+/// downscale ×[`BLUR_DOWNSCALE`] → 3× box blur (an O(radius) Gaussian
+/// approximation) → bilinear upscale → multiply RGB by `(1 - dim)`.
+///
+/// Returns a `size`-shaped BGRA buffer. A degenerate `size`, or a `sharp`
+/// buffer that is too short, yields a plain copy.
+#[must_use]
+pub fn blur_dim(sharp: &[u8], size: Size, radius: u32, dim: f64) -> Vec<u8> {
+    let needed = size.w as usize * size.h as usize * 4;
+    if size.is_empty() || sharp.len() < needed {
+        return sharp.to_vec();
+    }
+    let (small, small_size) = downscale_avg(&sharp[..needed], size, BLUR_DOWNSCALE);
+    let mut small_f: Vec<f32> = small.iter().map(|&b| f32::from(b)).collect();
+    box_blur_3x(&mut small_f, small_size, radius);
+    let small_blurred: Vec<u8> = small_f
+        .iter()
+        .map(|&v| v.round().clamp(0.0, 255.0) as u8)
+        .collect();
+    let mut out = upscale_bilinear(&small_blurred, small_size, size);
+    dim_in_place(&mut out, dim);
+    out
+}
+
+/// Average each `factor`×`factor` block of a BGRA buffer into one pixel.
+fn downscale_avg(src: &[u8], size: Size, factor: u32) -> (Vec<u8>, Size) {
+    let f = factor.max(1) as usize;
+    let (sw, sh) = (size.w as usize, size.h as usize);
+    let dw = (sw / f).max(1);
+    let dh = (sh / f).max(1);
+    let mut out = vec![0u8; dw * dh * 4];
+    for dy in 0..dh {
+        for dx in 0..dw {
+            for c in 0..4 {
+                let (mut sum, mut n) = (0u32, 0u32);
+                for yy in 0..f {
+                    let sy = dy * f + yy;
+                    if sy >= sh {
+                        break;
+                    }
+                    for xx in 0..f {
+                        let sx = dx * f + xx;
+                        if sx >= sw {
+                            break;
+                        }
+                        sum += u32::from(src[(sy * sw + sx) * 4 + c]);
+                        n += 1;
+                    }
+                }
+                out[(dy * dw + dx) * 4 + c] = (sum / n.max(1)) as u8;
+            }
+        }
+    }
+    (out, Size::new(dw as u32, dh as u32))
+}
+
+/// Bilinear resample a BGRA buffer from `src_size` to `dst_size`.
+fn upscale_bilinear(src: &[u8], src_size: Size, dst_size: Size) -> Vec<u8> {
+    let (sw, sh) = (src_size.w as usize, src_size.h as usize);
+    let (dw, dh) = (dst_size.w as usize, dst_size.h as usize);
+    let mut out = vec![0u8; dw * dh * 4];
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return out;
+    }
+    let fx = sw as f32 / dw as f32;
+    let fy = sh as f32 / dh as f32;
+    for dy in 0..dh {
+        let syf = ((dy as f32 + 0.5) * fy - 0.5).max(0.0);
+        let sy0 = (syf as usize).min(sh - 1);
+        let sy1 = (sy0 + 1).min(sh - 1);
+        let wy = (syf - sy0 as f32).clamp(0.0, 1.0);
+        for dx in 0..dw {
+            let sxf = ((dx as f32 + 0.5) * fx - 0.5).max(0.0);
+            let sx0 = (sxf as usize).min(sw - 1);
+            let sx1 = (sx0 + 1).min(sw - 1);
+            let wx = (sxf - sx0 as f32).clamp(0.0, 1.0);
+            for c in 0..4 {
+                let p = |x: usize, y: usize| f32::from(src[(y * sw + x) * 4 + c]);
+                let top = p(sx0, sy0) * (1.0 - wx) + p(sx1, sy0) * wx;
+                let bot = p(sx0, sy1) * (1.0 - wx) + p(sx1, sy1) * wx;
+                out[(dy * dw + dx) * 4 + c] =
+                    (top * (1.0 - wy) + bot * wy).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Three box-filter passes per axis — visually a Gaussian, O(radius) per
+/// pixel. In place on an interleaved 4-channel `f32` buffer (`f32` so the
+/// six passes don't bleed mass through integer truncation).
+fn box_blur_3x(buf: &mut [f32], size: Size, radius: u32) {
+    if radius == 0 || size.is_empty() {
+        return;
+    }
+    let r = (radius as usize).min(size.w.max(size.h) as usize);
+    let mut tmp = vec![0f32; buf.len()];
+    for _ in 0..3 {
+        box_pass(buf, &mut tmp, size, r, Axis::Horizontal);
+        box_pass(&tmp, buf, size, r, Axis::Vertical);
+    }
+}
+
+enum Axis {
+    Horizontal,
+    Vertical,
+}
+
+/// One moving-average pass along `axis`, `src` → `dst`, window `2r+1`,
+/// edges clamped.
+fn box_pass(src: &[f32], dst: &mut [f32], size: Size, r: usize, axis: Axis) {
+    let (w, h) = (size.w as usize, size.h as usize);
+    // (number of lines, pixels per line, byte step within a line, byte
+    // offset between consecutive lines)
+    let (lines, line_len, step, line_base) = match axis {
+        Axis::Horizontal => (h, w, 4, w * 4),
+        Axis::Vertical => (w, h, w * 4, 4),
+    };
+    let win = (2 * r + 1) as f32;
+    for line in 0..lines {
+        let base = line * line_base;
+        for c in 0..4 {
+            let at = |i: usize| src[base + i * step + c];
+            let last = line_len - 1;
+            let mut sum = at(0) * (r as f32 + 1.0);
+            for k in 1..=r {
+                sum += at(k.min(last));
+            }
+            for i in 0..line_len {
+                dst[base + i * step + c] = sum / win;
+                sum += at((i + r + 1).min(last));
+                sum -= at(i.saturating_sub(r));
+            }
+        }
+    }
+}
+
+/// Multiply RGB by `(1 - dim)` (fixed point), leaving the X byte alone.
+fn dim_in_place(buf: &mut [u8], dim: f64) {
+    let k = ((1.0 - dim.clamp(0.0, 0.5)) * 256.0).round() as u32;
+    for px in buf.chunks_exact_mut(4) {
+        px[0] = ((u32::from(px[0]) * k) >> 8) as u8;
+        px[1] = ((u32::from(px[1]) * k) >> 8) as u8;
+        px[2] = ((u32::from(px[2]) * k) >> 8) as u8;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +585,136 @@ mod tests {
         let src = solid(3, 3, Rgba([9, 9, 9, 255]));
         let out = compose(&src, Mode::Fill, RED, Size::new(7, 5));
         assert_eq!(out.len(), 7 * 5 * 4);
+    }
+
+    // --- blur pipeline ---
+
+    /// A `w`x`h` BGRA buffer where every channel of every pixel is `v`.
+    fn flat(w: usize, h: usize, v: u8) -> Vec<u8> {
+        vec![v; w * h * 4]
+    }
+
+    fn variance(buf: &[u8]) -> f64 {
+        let n = buf.len() as f64;
+        let mean = buf.iter().map(|&b| f64::from(b)).sum::<f64>() / n;
+        buf.iter()
+            .map(|&b| (f64::from(b) - mean).powi(2))
+            .sum::<f64>()
+            / n
+    }
+
+    fn mean(buf: &[u8]) -> f64 {
+        buf.iter().map(|&b| f64::from(b)).sum::<f64>() / buf.len() as f64
+    }
+
+    #[test]
+    fn downscale_avg_of_uniform_is_uniform() {
+        let src = flat(8, 8, 200);
+        let (small, size) = downscale_avg(&src, Size::new(8, 8), 4);
+        assert_eq!(size, Size::new(2, 2));
+        assert!(small.iter().all(|&b| b == 200));
+    }
+
+    #[test]
+    fn downscale_avg_averages_a_block() {
+        // 2x2 image, factor 2, values 0/100/200/255 in the B channel.
+        let mut src = vec![0u8; 2 * 2 * 4];
+        for (i, v) in [0u8, 100, 200, 255].into_iter().enumerate() {
+            src[i * 4] = v;
+        }
+        let (small, size) = downscale_avg(&src, Size::new(2, 2), 2);
+        assert_eq!(size, Size::new(1, 1));
+        assert_eq!(small[0], ((100 + 200 + 255) / 4) as u8); // 0+100+200+255 = 555
+    }
+
+    #[test]
+    fn upscale_bilinear_of_uniform_is_uniform() {
+        let src = flat(3, 2, 77);
+        let out = upscale_bilinear(&src, Size::new(3, 2), Size::new(12, 9));
+        assert_eq!(out.len(), 12 * 9 * 4);
+        assert!(out.iter().all(|&b| b == 77));
+    }
+
+    #[test]
+    fn upscale_bilinear_interpolates_a_ramp() {
+        // 2x1, B channel 0 then 240; upscale to 8x1 → monotone non-decreasing.
+        let mut src = vec![0u8; 2 * 4];
+        src[4] = 240;
+        let out = upscale_bilinear(&src, Size::new(2, 1), Size::new(8, 1));
+        let bs: Vec<u8> = out.chunks_exact(4).map(|p| p[0]).collect();
+        assert_eq!(bs[0], 0);
+        assert!(bs.windows(2).all(|w| w[0] <= w[1]), "{bs:?}");
+        assert!(*bs.last().unwrap() >= 200);
+    }
+
+    #[test]
+    fn box_blur_radius_zero_is_identity() {
+        let mut a = vec![0f32; 5 * 5 * 4];
+        a[(2 * 5 + 2) * 4] = 255.0;
+        let before = a.clone();
+        box_blur_3x(&mut a, Size::new(5, 5), 0);
+        assert_eq!(a, before);
+    }
+
+    #[test]
+    fn box_blur_spreads_a_spike_and_lowers_the_peak() {
+        // Field wide enough that a radius-3, 6-pass blur (±18 px) stays clear
+        // of the clamped edges, so mass is conserved.
+        let w = 41usize;
+        let mut a = vec![0f32; w * w * 4];
+        let centre = (w / 2 * w + w / 2) * 4;
+        a[centre] = 255.0;
+        box_blur_3x(&mut a, Size::new(w as u32, w as u32), 3);
+        assert!(a[centre] < 255.0, "peak not reduced: {}", a[centre]);
+        assert!(
+            a[(w / 2 * w + w / 2 + 2) * 4] > 0.0,
+            "energy did not spread"
+        );
+        let total: f32 = a.iter().step_by(4).sum();
+        assert!(
+            (250.0..=260.0).contains(&total),
+            "mass {total} not conserved"
+        );
+    }
+
+    #[test]
+    fn dim_scales_rgb_not_x() {
+        let mut a = vec![200u8, 200, 200, 200];
+        dim_in_place(&mut a, 0.5);
+        assert!((98..=102).contains(&a[0]));
+        assert!((98..=102).contains(&a[1]));
+        assert!((98..=102).contains(&a[2]));
+        assert_eq!(a[3], 200); // X untouched
+
+        let mut b = vec![123u8, 45, 67, 255];
+        dim_in_place(&mut b, 0.0);
+        assert_eq!(&b[..3], &[123, 45, 67]); // dim 0 = identity
+    }
+
+    #[test]
+    fn blur_dim_lowers_variance_and_mean() {
+        // A high-contrast 32x32 checkerboard in BGRA.
+        let w = 32usize;
+        let mut sharp = vec![0u8; w * w * 4];
+        for y in 0..w {
+            for x in 0..w {
+                let v = if (x / 4 + y / 4) % 2 == 0 { 240 } else { 10 };
+                let i = (y * w + x) * 4;
+                sharp[i..i + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let out = blur_dim(&sharp, Size::new(w as u32, w as u32), 6, 0.15);
+        assert_eq!(out.len(), sharp.len());
+        assert!(
+            variance(&out) < variance(&sharp) * 0.6,
+            "not blurred enough"
+        );
+        assert!(mean(&out) < mean(&sharp), "not dimmed");
+    }
+
+    #[test]
+    fn blur_dim_degenerate_size_is_a_copy() {
+        let sharp = flat(4, 4, 50);
+        assert_eq!(blur_dim(&sharp, Size::new(0, 4), 5, 0.2), sharp);
     }
 }

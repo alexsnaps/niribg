@@ -31,6 +31,20 @@ impl Color {
         let prem = |c: u8| ((u16::from(c) * a) / 255) as u8;
         [prem(self.b), prem(self.g), prem(self.r), self.a]
     }
+
+    /// This colour with RGB scaled by `(1 - dim)` — the dimmed overview
+    /// backdrop for a colour-only wallpaper.
+    #[must_use]
+    pub fn dimmed(self, dim: f64) -> Color {
+        let k = 1.0 - dim.clamp(0.0, 1.0);
+        let s = |c: u8| (f64::from(c) * k).round().clamp(0.0, 255.0) as u8;
+        Color {
+            r: s(self.r),
+            g: s(self.g),
+            b: s(self.b),
+            a: self.a,
+        }
+    }
 }
 
 /// Why a colour string failed to parse. Hand-rolled to avoid a `thiserror`

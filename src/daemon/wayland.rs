@@ -118,6 +118,12 @@ pub(super) struct OutputEntry {
     pub status: PaintStatus,
     /// Physical size of the buffer currently on screen, if any.
     pub painted: Option<Size>,
+    /// The last render's buffers, retained so an overview toggle is an
+    /// instant swap (and M3's crossfade has both to blend). Both are BGRA at
+    /// `buffers_size`.
+    pub sharp: Option<Vec<u8>>,
+    pub blurred: Option<Vec<u8>>,
+    pub buffers_size: Option<Size>,
 }
 
 /// Where an output's wallpaper currently stands.
@@ -231,6 +237,9 @@ impl DaemonState {
                 resolved,
                 status: PaintStatus::Pending,
                 painted: None,
+                sharp: None,
+                blurred: None,
+                buffers_size: None,
             },
         );
     }
@@ -336,11 +345,19 @@ impl DaemonState {
             return;
         }
 
+        let (radius, dim) = (self.config.blur.radius, self.config.blur.dim);
+
         match entry.resolved.path.clone() {
             None => {
                 let color = entry.resolved.color;
                 let name = entry.name.clone();
-                self.commit_pixels(id, &render::solid(color, phys), phys);
+                // Colour source: build both buffers inline, retain, present.
+                if let Some(e) = self.wl.outputs.get_mut(id) {
+                    e.sharp = Some(render::solid(color, phys));
+                    e.blurred = Some(render::solid(color.dimmed(dim), phys));
+                    e.buffers_size = Some(phys);
+                }
+                self.present(id);
                 self.note_result(token, &name, None);
             }
             Some(path) => {
@@ -350,7 +367,8 @@ impl DaemonState {
                 let name = entry.name.clone();
                 tracing::trace!(output = %name, first_paint, ?phys, "queueing image job");
                 if first_paint {
-                    // Show something immediately so the layer surface maps.
+                    // Show the fill colour immediately so the surface maps;
+                    // the image swaps in when the worker returns.
                     self.commit_pixels(id, &render::solid(color, phys), phys);
                 }
                 self.worker.submit(super::worker::Job {
@@ -360,9 +378,47 @@ impl DaemonState {
                     path,
                     mode,
                     fill: color,
+                    blur_radius: radius,
+                    blur_dim: dim,
                 });
             }
         }
+    }
+
+    /// Overview opened or closed: swap every output's wallpaper between its
+    /// sharp and blurred buffer. No fade in M2 (M3 adds the crossfade).
+    pub(super) fn set_overview_open(&mut self, open: bool) {
+        if self.overview_open == open {
+            return;
+        }
+        self.overview_open = open;
+        tracing::debug!(open, "overview toggled");
+        if !self.config.blur.enable {
+            return; // nothing to swap
+        }
+        let ids: Vec<ObjectId> = self.wl.outputs.keys().cloned().collect();
+        for id in ids {
+            self.present(&id);
+        }
+    }
+
+    /// Present the buffer that matches the current overview state — blurred
+    /// when the overview is open and blur is enabled, else sharp — falling
+    /// back to sharp whenever the blurred buffer is not (yet) available.
+    fn present(&mut self, id: &ObjectId) {
+        let Some(entry) = self.wl.outputs.get(id) else {
+            return;
+        };
+        let Some(size) = entry.buffers_size else {
+            return;
+        };
+        let want_blur = self.overview_open && self.config.blur.enable;
+        let buf = match (want_blur, &entry.blurred, &entry.sharp) {
+            (true, Some(b), _) => b.clone(),
+            (_, _, Some(s)) => s.clone(),
+            _ => return,
+        };
+        self.commit_pixels(id, &buf, size);
     }
 
     /// Copy `pixels` (BGRA, `size`) into a fresh shm slot and present it.
@@ -444,7 +500,12 @@ impl DaemonState {
         let error = match result.outcome {
             Ok(rendered) => match &id {
                 Some(id) if self.output_wants(id, rendered.size) => {
-                    self.commit_pixels(id, &rendered.pixels, rendered.size);
+                    if let Some(e) = self.wl.outputs.get_mut(id) {
+                        e.buffers_size = Some(rendered.size);
+                        e.sharp = Some(rendered.sharp);
+                        e.blurred = Some(rendered.blurred);
+                    }
+                    self.present(id);
                     None
                 }
                 Some(_) => {
@@ -535,12 +596,12 @@ impl DaemonState {
 
         Status {
             pid: std::process::id(),
-            niri_connected: false, // M2
+            niri_connected: self.niri_connected,
             blur: BlurStatus {
                 enable: self.config.blur.enable,
                 radius: self.config.blur.radius,
                 dim: self.config.blur.dim,
-                active: false, // M2
+                active: self.overview_open && self.config.blur.enable,
             },
             transition_ms: self.config.transition_ms,
             outputs: rows,

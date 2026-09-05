@@ -20,7 +20,8 @@ use crate::config::Mode;
 /// rejected rather than risking an out-of-memory abort.
 pub const MAX_PIXELS: u64 = 100_000_000;
 
-/// Render `source` for one output at `target` physical pixels.
+/// Render an image wallpaper for one output at `target` physical pixels.
+/// Colour-only wallpapers never reach the worker.
 pub struct Job {
     pub token: u64,
     pub output: String,
@@ -29,14 +30,21 @@ pub struct Job {
     pub mode: Mode,
     /// Letterbox / transparency fill.
     pub fill: Color,
+    /// Box-blur radius (at the downscaled resolution) for the overview
+    /// backdrop.
+    pub blur_radius: u32,
+    /// How much to darken the blurred backdrop, `0.0..=0.5`.
+    pub blur_dim: f64,
 }
 
-/// A finished render: `pixels` is `Xrgb8888` BGRA at `size`, stride
-/// `size.w * 4`.
+/// A finished render. Both buffers are `Xrgb8888` BGRA at `size`, stride
+/// `size.w * 4`: `sharp` is the wallpaper, `blurred` its dimmed overview
+/// backdrop.
 #[derive(Debug)]
 pub struct Rendered {
     pub size: Size,
-    pub pixels: Vec<u8>,
+    pub sharp: Vec<u8>,
+    pub blurred: Vec<u8>,
 }
 
 /// The outcome of one [`Job`], tagged with its identifiers so the loop can
@@ -98,8 +106,11 @@ fn worker_loop(rx: &Receiver<Job>, results: &calloop::channel::Sender<JobResult>
             path,
             mode,
             fill,
+            blur_radius,
+            blur_dim,
         } = job;
-        let outcome = render_image(&path, mode, fill, target).map_err(|e| format!("{e:#}"));
+        let outcome = render_image(&path, mode, fill, target, blur_radius, blur_dim)
+            .map_err(|e| format!("{e:#}"));
         if results
             .send(JobResult {
                 token,
@@ -122,9 +133,16 @@ fn check_area(w: u32, h: u32) -> Result<()> {
     Ok(())
 }
 
-/// Decode `path`, reject anything over [`MAX_PIXELS`], and compose it for
-/// `target` under `mode` over `fill`.
-fn render_image(path: &PathBuf, mode: Mode, fill: Color, target: Size) -> Result<Rendered> {
+/// Decode `path`, reject anything over [`MAX_PIXELS`], compose it for `target`
+/// under `mode` over `fill`, and build its blurred/dimmed overview backdrop.
+fn render_image(
+    path: &PathBuf,
+    mode: Mode,
+    fill: Color,
+    target: Size,
+    blur_radius: u32,
+    blur_dim: f64,
+) -> Result<Rendered> {
     let (w, h) = image::image_dimensions(path)
         .with_context(|| format!("reading image dimensions of {}", path.display()))?;
     check_area(w, h).with_context(|| format!("{}", path.display()))?;
@@ -137,10 +155,12 @@ fn render_image(path: &PathBuf, mode: Mode, fill: Color, target: Size) -> Result
         .with_context(|| format!("decoding {}", path.display()))?
         .into_rgba8();
 
-    let pixels = render::compose(&image, mode, fill, target);
+    let sharp = render::compose(&image, mode, fill, target);
+    let blurred = render::blur_dim(&sharp, target, blur_radius, blur_dim);
     Ok(Rendered {
         size: target,
-        pixels,
+        sharp,
+        blurred,
     })
 }
 
@@ -166,44 +186,55 @@ mod tests {
         RgbaImage::from_pixel(w, h, px).save(path).unwrap();
     }
 
+    fn job(token: u64, path: PathBuf, target: Size, mode: Mode) -> Job {
+        Job {
+            token,
+            output: "o".into(),
+            target,
+            path,
+            mode,
+            fill: Color::BLACK,
+            blur_radius: 8,
+            blur_dim: 0.15,
+        }
+    }
+
     #[test]
-    fn renders_a_png_to_target_size() {
+    fn renders_a_png_to_target_size_with_both_buffers() {
         let png = scratch("wall.png");
         write_png(&png, 8, 8, Rgba([0, 128, 255, 255]));
 
         let (tx, chan) = calloop::channel::channel::<JobResult>();
         let worker = Worker::spawn(tx);
         worker.submit(Job {
-            token: 7,
             output: "eDP-1".into(),
-            target: Size::new(4, 3),
-            path: png,
-            mode: Mode::Stretch,
-            fill: Color::BLACK,
+            ..job(7, png, Size::new(16, 12), Mode::Stretch)
         });
 
         let res = chan.recv().expect("a result");
         assert_eq!(res.token, 7);
         assert_eq!(res.output, "eDP-1");
-        let rendered = res.outcome.expect("ok");
-        assert_eq!(rendered.size, Size::new(4, 3));
-        assert_eq!(rendered.pixels.len(), 4 * 3 * 4);
-        // stretch of a solid image → every pixel is that colour in BGRA
-        assert_eq!(&rendered.pixels[0..4], &[255, 128, 0, 255]);
+        let r = res.outcome.expect("ok");
+        assert_eq!(r.size, Size::new(16, 12));
+        assert_eq!(r.sharp.len(), 16 * 12 * 4);
+        assert_eq!(r.blurred.len(), r.sharp.len());
+        // stretch of a solid image → sharp is that colour in BGRA
+        assert_eq!(&r.sharp[0..4], &[255, 128, 0, 255]);
+        // blurred+dimmed differs from sharp (dim pulls the channels down)
+        assert_ne!(r.blurred, r.sharp);
+        assert!(r.blurred[0] < r.sharp[0], "blurred not dimmed");
     }
 
     #[test]
     fn missing_file_is_an_err_result_not_a_panic() {
         let (tx, chan) = calloop::channel::channel::<JobResult>();
         let worker = Worker::spawn(tx);
-        worker.submit(Job {
-            token: 1,
-            output: "x".into(),
-            target: Size::new(2, 2),
-            path: PathBuf::from("/no/such/wallpaper.png"),
-            mode: Mode::Fill,
-            fill: Color::BLACK,
-        });
+        worker.submit(job(
+            1,
+            PathBuf::from("/no/such/wallpaper.png"),
+            Size::new(2, 2),
+            Mode::Fill,
+        ));
         let res = chan.recv().unwrap();
         let err = res.outcome.unwrap_err();
         assert!(err.contains("/no/such/wallpaper.png"), "{err}");
@@ -222,8 +253,9 @@ mod tests {
     fn a_normal_image_passes_and_composes() {
         let png = scratch("ok.png");
         write_png(&png, 64, 64, Rgba([1, 2, 3, 255]));
-        let r = render_image(&png, Mode::Fit, Color::BLACK, Size::new(10, 10)).unwrap();
-        assert_eq!(r.pixels.len(), 10 * 10 * 4);
+        let r = render_image(&png, Mode::Fit, Color::BLACK, Size::new(10, 10), 6, 0.2).unwrap();
+        assert_eq!(r.sharp.len(), 10 * 10 * 4);
+        assert_eq!(r.blurred.len(), 10 * 10 * 4);
     }
 
     #[test]
@@ -240,14 +272,7 @@ mod tests {
         for token in 0..5 {
             let png = scratch(&format!("j{token}.png"));
             write_png(&png, 4, 4, Rgba([token as u8, 0, 0, 255]));
-            worker.submit(Job {
-                token,
-                output: "o".into(),
-                target: Size::new(2, 2),
-                path: png,
-                mode: Mode::Stretch,
-                fill: Color::BLACK,
-            });
+            worker.submit(job(token, png, Size::new(2, 2), Mode::Stretch));
         }
         for expected in 0..5 {
             assert_eq!(chan.recv().unwrap().token, expected);
