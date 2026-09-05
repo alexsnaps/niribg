@@ -1,0 +1,26 @@
+# Example niribg config. Copy to ~/.config/niribg/config.toml and edit.
+# Every key is optional; the values shown are the built-in defaults unless
+# noted. See DESIGN.md §6 for the full reference.
+
+# Crossfade duration for blur toggles and wallpaper swaps. 0 = instant.
+transition_ms = 250
+
+[blur]
+# When false, niribg is only a wallpaper daemon (no blur on overview).
+enable = true
+# Stack-blur radius, in physical pixels at the downscaled resolution.
+radius = 30
+# How much to darken the blurred backdrop, 0.0..=0.5.
+dim = 0.15
+
+# Applies to every output that has no [output."NAME"] section of its own.
+[output.default]
+path = "~/Pictures/wallpaper.jpg"
+mode = "fill"        # fill | fit | stretch | center
+color = "#000000"    # fill / letterbox colour; used alone if `path` is omitted
+
+# Per-output override. Unset keys here fall back to [output.default], then to
+# the built-in defaults.
+# [output."DP-1"]
+# path = "~/Pictures/ultrawide.jpg"
+# mode = "fit"
