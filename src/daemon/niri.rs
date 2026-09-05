@@ -24,6 +24,10 @@ pub(super) const BACKOFF_MIN: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// Cap on a single event line before the connection is treated as broken.
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
+/// The handshake (`EventStream` request + `{"Ok":"Handled"}` reply) runs
+/// blocking on the event-loop thread, so bound it: a niri that accepts the
+/// connection but stalls must not freeze the daemon.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl DaemonState {
     /// Kick off the niri IPC connection (called once at startup, then again
@@ -59,6 +63,11 @@ impl DaemonState {
             )
         })?;
         let stream = UnixStream::connect(&path)?;
+
+        // Bound the blocking handshake (see HANDSHAKE_TIMEOUT). Cleared by
+        // `set_nonblocking(true)` once we hand the stream to calloop.
+        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
 
         let mut req = serde_json::to_string(&Request::EventStream).expect("Request serializes");
         req.push('\n');
