@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! niri IPC — a `calloop` `Generic` source on `$NIRI_SOCKET` that turns
 //! `OverviewOpenedOrClosed` events into blur-target changes.
 //!

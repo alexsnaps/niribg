@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! `niribg` command-line entry point: parse args, set up logging, then either
 //! run the daemon or send one command to a running one.
 

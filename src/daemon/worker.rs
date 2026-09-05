@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! The image worker: one background thread that decodes and composes
 //! wallpapers so the event loop never blocks on a large file.
 //!

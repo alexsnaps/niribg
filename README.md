@@ -32,12 +32,12 @@ the overview opens.
 ## Install
 
 ```sh
-# from crates.io
-cargo install niribg
+# from crates.io — the crate is `niri-bg`, the binary it installs is `niribg`
+cargo install niri-bg
 
 # or the prebuilt-binary installer (Linux x86_64, gnu or musl)
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/alexsnaps/niribg/releases/latest/download/niribg-installer.sh | sh
+  https://github.com/alexsnaps/niribg/releases/latest/download/niri-bg-installer.sh | sh
 
 # or from source
 git clone https://github.com/alexsnaps/niribg && cd niribg
@@ -184,4 +184,17 @@ missing. Starting a second daemon on the same socket is refused unless
 
 ## License
 
-Apache-2.0.
+`niri-bg` is licensed under the **GNU General Public License v3.0 or later**
+(see [`LICENSE`](LICENSE)) — it links `niri-ipc`, which is GPLv3, and niri
+itself is GPLv3.
+
+```
+Copyright (C) 2026 Alex Snaps
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. This program is distributed WITHOUT ANY WARRANTY; without even
+the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See the GNU General Public License for more details.
+```

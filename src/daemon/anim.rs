@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Timed easing for the crossfade. Timing only — interruption is handled by
 //! the caller swapping out the whole `Transition`.
 

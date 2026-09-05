@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! `state.json` — runtime `niribg set` overrides that outlive a daemon
 //! restart without ever rewriting the user's hand-edited `config.toml`.
 //!

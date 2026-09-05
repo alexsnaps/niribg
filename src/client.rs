@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! The client half of the control protocol: connect, send one newline-JSON
 //! [`Request`], read one [`WireReply`] line. Used both by the CLI
 //! subcommands and by `niribg daemon` when it probes for an existing daemon.

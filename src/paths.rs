@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! XDG path resolution and `~` / `${VAR}` expansion, hand-rolled to avoid a
 //! `dirs` / `shellexpand` dependency.
 //!

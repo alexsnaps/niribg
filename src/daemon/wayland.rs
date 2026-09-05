@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Wayland: one `background` layer-shell surface per output, painted from an
 //! shm slot pool.
 //!

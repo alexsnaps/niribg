@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! `niribg` — wallpaper daemon for the niri Wayland compositor, with blur on
 //! overview.
 //!

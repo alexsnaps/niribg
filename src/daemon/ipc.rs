@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Control-socket command handling.
 //!
 //! [`dispatch`] turns one [`Request`] into a [`Reply`] against a [`Control`]

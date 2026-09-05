@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! The long-lived `niribg daemon`.
 //!
 //! M1: a single-threaded `calloop` loop. Sources: the control socket

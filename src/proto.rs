@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Wire types for the `niribg` control socket.
 //!
 //! One newline-delimited JSON [`Request`] per line, one [`WireReply`] line

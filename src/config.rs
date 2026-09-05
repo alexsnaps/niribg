@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! `config.toml` — parsing, defaults, and per-output resolution.
 //!
 //! Precedence, merged key by key:

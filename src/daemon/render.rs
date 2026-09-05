@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Fit-mode geometry and RGBA→BGRA composition. Pure; no Wayland, no config
 //! I/O. The image worker calls [`compose`] to turn a decoded image plus a
 //! [`crate::config::Mode`] into the exact bytes of an `Xrgb8888` shm buffer.

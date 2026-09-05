@@ -351,8 +351,9 @@ stable.
 
 ## 11. Distribution
 
-- **License:** Apache-2.0.
-- `cargo install niribg` (crates.io) — baseline.
+- **License:** GPL-3.0-or-later. (Originally Apache-2.0; changed once M4
+  review found `niri-ipc` is GPLv3 — see §16.)
+- `cargo install niri-bg` (crate `niri-bg`, binary `niribg`) — baseline.
 - `cargo-dist` → GitHub Releases with prebuilt `x86_64` gnu + musl tarballs.
 - No AUR / COPR / Nix in v1.
 - SemVer from `0.1.0`, no pre-1.0 stability promise.
@@ -372,7 +373,7 @@ Each is independently testable.
 
 - **M0 — Skeleton.** Cargo (ed. 2024), clap dispatch, `proto.rs`,
   `config` / `state` + tests, XDG paths, colour parse, `tracing`, CI,
-  Apache-2.0, README stub. `niribg daemon` runs a plain single-threaded
+  `LICENSE` (Apache-2.0 then, GPL-3.0-or-later since M4), README stub. `niribg daemon` runs a plain single-threaded
   `UnixListener` accept loop (replaced by the `calloop` loop in M1 so its
   version is co-selected with SCTK); `niribg get` / `version` / `quit` work
   over the socket, `get` returning a stub status.
@@ -928,3 +929,20 @@ a `TESTING.md` item. The M4 milestone bullet's mention of them is superseded.
 distro packagers regenerate them from `build.rs`'s `OUT_DIR` output. The
 release tarballs carry the static docs listed in `[package.metadata.dist]
 include`.
+
+### Licensing
+
+Started Apache-2.0. The M4 dependency-license audit found **`niri-ipc`
+26.4.0 is `GPL-3.0-or-later`** — the original grill assumed it was permissive
+and that was wrong. `niri-ipc` is a compile-time dependency (typed
+`Request` / `Reply` / `Event` for the niri IPC wire format), so the
+distributed binary is a GPLv3 combined work. niri itself is GPLv3, so a
+niri-specific tool being GPLv3 is natural.
+
+`niri-bg` is therefore **GPL-3.0-or-later** (`Cargo.toml` `license`, verbatim
+`LICENSE`, `deny.toml` allowlist). Every other crate in the graph is
+permissive (`MIT` / `Apache-2.0` / `BSD` / `Zlib` / `Unicode-3.0`).
+
+The alternative — reimplement the ~15 lines of niri wire handling with
+`serde_json::Value` and drop `niri-ipc` to stay permissive — was considered
+and rejected.

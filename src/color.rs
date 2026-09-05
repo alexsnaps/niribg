@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Hex colour parsing for wallpaper fill / letterbox colours.
 
 use std::fmt;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Generate the man page (`niribg.1`) and bash/zsh/fish completions into
 //! `$OUT_DIR` at build time. `cargo install` does not install these; distro
 //! packaging picks them out of `target/<profile>/build/niribg-*/out/`.

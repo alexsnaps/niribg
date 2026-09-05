@@ -1,16 +1,28 @@
 [package]
-name = "niribg"
+# Published to crates.io as `niri-bg`; the binary and the `niribg` library
+# target keep the compact name.
+name = "niri-bg"
 version = "0.1.0"
 edition = "2024"
 description = "Wallpaper daemon for the niri Wayland compositor, with blur on overview"
 repository = "https://github.com/alexsnaps/niribg"
 homepage = "https://github.com/alexsnaps/niribg"
-license = "Apache-2.0"
+# GPLv3: `niri-ipc` (a compile-time dependency) is GPL-3.0-or-later, and niri
+# itself is GPLv3.
+license = "GPL-3.0-or-later"
 keywords = ["niri", "wayland", "wallpaper", "layer-shell"]
 categories = ["command-line-utilities"]
 readme = "README.md"
 rust-version = "1.85"
 exclude = [".github/", "TESTING.md", "DESIGN.md"]
+
+[lib]
+name = "niribg"
+path = "src/lib.rs"
+
+[[bin]]
+name = "niribg"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! The `niribg` command-line interface.
 //!
 //! Kept free of the `niribg` library crate so `build.rs` can pull it in with
