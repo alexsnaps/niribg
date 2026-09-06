@@ -67,6 +67,15 @@ pub fn run(socket: &Path, config_path: Option<PathBuf>, replace: bool) -> Result
     let handle = event_loop.handle();
     let signal = event_loop.get_signal();
 
+    // Build the signal source *before* spawning any thread: `Signals::new`
+    // blocks these signals via `pthread_sigmask`, which only masks the calling
+    // thread. Threads spawned afterwards inherit the mask; one spawned earlier
+    // (the render worker) would not, so a process-directed SIGHUP would land on
+    // it and kill the daemon (SIGHUP's default disposition) instead of being
+    // read from the signalfd here.
+    let signals = Signals::new(&[Signal::SIGHUP, Signal::SIGTERM, Signal::SIGINT])
+        .context("registering signal handler")?;
+
     // Image worker: jobs go out over an mpsc channel inside `Worker`, results
     // come back here over a calloop channel so the loop is woken to apply
     // them.
@@ -108,8 +117,7 @@ pub fn run(socket: &Path, config_path: Option<PathBuf>, replace: bool) -> Result
 
     handle
         .insert_source(
-            Signals::new(&[Signal::SIGHUP, Signal::SIGTERM, Signal::SIGINT])
-                .context("registering signal handler")?,
+            signals,
             |event, _, state: &mut DaemonState| match event.signal() {
                 Signal::SIGHUP => {
                     tracing::info!("SIGHUP: reloading config");
