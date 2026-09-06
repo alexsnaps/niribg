@@ -170,6 +170,24 @@ pub(super) enum Frame<'a> {
     Fade(f32),
 }
 
+/// Return free heap pages to the OS after a crossfade. A crossfade can briefly
+/// hold an owned snapshot (an interrupted fade's `from`); once dropped,
+/// glibc keeps the span in its arena unless the freed chunk happened to be the
+/// arena top. `malloc_trim` releases it regardless. glibc only — a no-op on
+/// musl and non-Linux.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn reclaim_freed_heap() {
+    // SAFETY: glibc's `malloc_trim`; niri-bg uses the default system allocator
+    // and glibc's malloc is internally synchronised. Worst case it does
+    // nothing and returns 0.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn reclaim_freed_heap() {}
+
 /// Where an output's wallpaper currently stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PaintStatus {
@@ -540,6 +558,11 @@ impl DaemonState {
             if let Some(e) = self.wl.outputs.get_mut(id) {
                 e.transition = None;
             }
+            // The fade is over: its endpoints — and any owned mid-fade snapshot
+            // from an interrupt — are dropped. Hand the pages back now; glibc's
+            // own `free()` trim only catches the arena's top chunk, and only
+            // when it happens to sit there.
+            reclaim_freed_heap();
         }
     }
 

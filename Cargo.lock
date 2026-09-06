@@ -484,6 +484,7 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "image",
+ "libc",
  "niri-ipc",
  "serde",
  "serde_json",

@@ -36,6 +36,10 @@ image = { version = "0.25", default-features = false, features = [
     "tiff",
     "webp",
 ] }
+# `malloc_trim` after a crossfade — return the freed blend/snapshot pages to
+# the OS instead of leaving them parked in the glibc arena. Linux/glibc only;
+# a no-op elsewhere. Already in the tree via `calloop`/`sctk`.
+libc = "0.2"
 niri-ipc = "26.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
