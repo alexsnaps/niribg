@@ -249,21 +249,31 @@ fn blit_over(out: &mut [u8], out_size: Size, fg: &RgbaImage, ox: u32, oy: u32, f
 /// The result is `min(a.len(), b.len())` bytes.
 #[must_use]
 pub fn blend(a: &[u8], b: &[u8], t: f32) -> Vec<u8> {
-    let n = a.len().min(b.len());
+    let mut out = vec![0u8; a.len().min(b.len())];
+    blend_into(&mut out, a, b, t);
+    out
+}
+
+/// [`blend`] without the allocation: write `(1 − t)·a + t·b` straight into
+/// `dst` — the crossfade path blends its retained endpoints directly into the
+/// shm canvas. Touches `min(dst.len(), a.len(), b.len())` bytes and leaves any
+/// tail of `dst` alone; `t` is clamped to `0.0..=1.0`.
+pub fn blend_into(dst: &mut [u8], a: &[u8], b: &[u8], t: f32) {
+    let n = dst.len().min(a.len()).min(b.len());
     if t <= 0.0 {
-        return a[..n].to_vec();
+        dst[..n].copy_from_slice(&a[..n]);
+        return;
     }
     if t >= 1.0 {
-        return b[..n].to_vec();
+        dst[..n].copy_from_slice(&b[..n]);
+        return;
     }
     // 0..=256 fixed point so the common endpoints are exact.
     let tb = (t * 256.0) as u32;
     let ta = 256 - tb;
-    let mut out = vec![0u8; n];
-    for ((o, &x), &y) in out.iter_mut().zip(&a[..n]).zip(&b[..n]) {
-        *o = ((u32::from(x) * ta + u32::from(y) * tb) >> 8) as u8;
+    for ((d, &x), &y) in dst[..n].iter_mut().zip(&a[..n]).zip(&b[..n]) {
+        *d = ((u32::from(x) * ta + u32::from(y) * tb) >> 8) as u8;
     }
-    out
 }
 
 // --- blur pipeline (M2) -------------------------------------------------
@@ -789,5 +799,34 @@ mod tests {
     #[test]
     fn blend_length_is_the_shorter_input() {
         assert_eq!(blend(&flat(4, 4, 1), &flat(2, 4, 2), 0.3).len(), 2 * 4 * 4);
+    }
+
+    #[test]
+    fn blend_into_matches_blend() {
+        let a = vec![0u8, 50, 150, 255, 10, 20, 30, 40];
+        let b = vec![255u8, 200, 100, 0, 240, 230, 220, 210];
+        for &t in &[-1.0, 0.0, 0.25, 0.5, 0.75, 1.0, 2.0] {
+            let mut dst = vec![0u8; a.len()];
+            blend_into(&mut dst, &a, &b, t);
+            assert_eq!(dst, blend(&a, &b, t), "t={t}");
+        }
+    }
+
+    #[test]
+    fn blend_into_leaves_the_dst_tail_untouched() {
+        let a = flat(2, 2, 40);
+        let b = flat(2, 2, 200);
+        let mut dst = vec![0xAAu8; a.len() + 5];
+        blend_into(&mut dst, &a, &b, 0.5);
+        assert!(dst[..a.len()].iter().all(|&v| (119..=121).contains(&v)));
+        assert!(dst[a.len()..].iter().all(|&v| v == 0xAA), "tail clobbered");
+    }
+
+    #[test]
+    fn blend_into_stops_at_the_shortest_slice() {
+        let mut dst = vec![0u8; 3];
+        blend_into(&mut dst, &[1, 2, 3, 4], &[9, 9], 0.5);
+        assert_eq!(&dst[..2], &[5, 5]);
+        assert_eq!(dst[2], 0); // untouched: b is only 2 bytes
     }
 }

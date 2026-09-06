@@ -157,6 +157,15 @@ pub(super) struct Transition {
     pub anim: Anim,
 }
 
+/// Pixel source for [`DaemonState::commit_frame`].
+pub(super) enum Frame<'a> {
+    /// A whole, already-composed BGRA buffer to copy into the shm canvas.
+    Whole(&'a [u8]),
+    /// Blend the output's live [`Transition`] endpoints at `t` directly into
+    /// the shm canvas (no intermediate buffer). Requires `entry.transition`.
+    Fade(f32),
+}
+
 /// Where an output's wallpaper currently stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PaintStatus {
@@ -407,7 +416,7 @@ impl DaemonState {
                 if first_paint {
                     // Show the fill colour immediately so the surface maps;
                     // the image swaps in when the worker returns.
-                    self.commit_pixels(id, &render::solid(resolved.color, phys), phys);
+                    self.commit_frame(id, Frame::Whole(&render::solid(resolved.color, phys)), phys);
                 }
                 self.worker.submit(super::worker::Job {
                     token,
@@ -469,22 +478,23 @@ impl DaemonState {
                 e.transition = None;
                 e.showing = showing;
             }
-            self.commit_pixels(id, &target, size);
+            self.commit_frame(id, Frame::Whole(&target), size);
             return;
         }
 
-        let first = render::blend(&current, &target, 0.0);
-        if let Some(e) = self.wl.outputs.get_mut(id) {
-            tracing::debug!(output = %e.name, ?showing, ms = dur.as_millis(), "crossfade start");
-            e.showing = showing;
-            e.transition = Some(Transition {
-                from: current,
-                to: target,
-                size,
-                anim: Anim::new(dur),
-            });
-        }
-        self.commit_pixels(id, &first, size); // re-requests a frame while a transition is live
+        let Some(e) = self.wl.outputs.get_mut(id) else {
+            return;
+        };
+        tracing::debug!(output = %e.name, ?showing, ms = dur.as_millis(), "crossfade start");
+        e.showing = showing;
+        e.transition = Some(Transition {
+            from: current,
+            to: target,
+            size,
+            anim: Anim::new(dur),
+        });
+        // `Fade(0.0)` copies `from` (== the old `current`) into the canvas.
+        self.commit_frame(id, Frame::Fade(0.0), size); // re-requests a frame while a transition is live
     }
 
     /// The exact pixels currently on screen for `id` (a mid-fade blend, or a
@@ -512,23 +522,24 @@ impl DaemonState {
         };
         let done = tr.anim.done();
         let size = tr.size;
-        let pixels = if done {
-            tr.to.clone()
-        } else {
-            render::blend(&tr.from, &tr.to, tr.anim.eased())
-        };
-        tracing::trace!(t = tr.anim.eased(), done, "crossfade frame");
+        // `Fade(1.0)` copies `to` exactly (blend's `t >= 1.0` fast path).
+        let t = if done { 1.0 } else { tr.anim.eased() };
+        tracing::trace!(t, done, "crossfade frame");
+        // Commit before clearing the transition — `Fade` reads its endpoints.
+        self.commit_frame(id, Frame::Fade(t), size);
         if done {
             if let Some(e) = self.wl.outputs.get_mut(id) {
                 e.transition = None;
             }
         }
-        self.commit_pixels(id, &pixels, size);
     }
 
-    /// Copy `pixels` (BGRA, `size`) into a fresh shm slot and present it. If
-    /// a crossfade is live, also requests the next frame callback.
-    fn commit_pixels(&mut self, id: &ObjectId, pixels: &[u8], size: Size) {
+    /// Fill a fresh shm slot per `frame`, `size` (BGRA), and present it. If a
+    /// crossfade is live, also requests the next frame callback.
+    ///
+    /// [`Frame::Fade`] blends the output's live [`Transition`] endpoints
+    /// straight into the shm canvas — no per-frame intermediate `Vec`.
+    fn commit_frame(&mut self, id: &ObjectId, frame: Frame<'_>, size: Size) {
         let Some(entry) = self.wl.outputs.get(id) else {
             return;
         };
@@ -550,6 +561,9 @@ impl DaemonState {
         // changes when the size does — skip re-sending it every crossfade
         // frame.
         let geometry_changed = entry.painted != Some(size);
+        // The settling frame of a fade: paint it, but don't chain another
+        // frame callback — `advance_transition` clears the transition next.
+        let terminal_fade = matches!(frame, Frame::Fade(t) if t >= 1.0);
 
         let buffer = match self.wl.pool.create_buffer(
             size.w as i32,
@@ -558,8 +572,24 @@ impl DaemonState {
             wl_shm::Format::Xrgb8888,
         ) {
             Ok((buffer, canvas)) => {
-                let n = canvas.len().min(pixels.len());
-                canvas[..n].copy_from_slice(&pixels[..n]);
+                match frame {
+                    Frame::Whole(pixels) => {
+                        let n = canvas.len().min(pixels.len());
+                        canvas[..n].copy_from_slice(&pixels[..n]);
+                    }
+                    // Disjoint borrow: `canvas` is `self.wl.pool`, the endpoints
+                    // are `self.wl.outputs` — read them back here so no blended
+                    // `Vec` is ever allocated per fade frame.
+                    Frame::Fade(t) => {
+                        match self.wl.outputs.get(id).and_then(|e| e.transition.as_ref()) {
+                            Some(tr) => render::blend_into(canvas, &tr.from, &tr.to, t),
+                            None => {
+                                tracing::error!("commit_frame(Fade) with no live transition");
+                                return;
+                            }
+                        }
+                    }
+                }
                 buffer
             }
             Err(err) => {
@@ -603,7 +633,7 @@ impl DaemonState {
             }
             e.painted = Some(size);
             e.status = PaintStatus::Painted;
-            let want = e.transition.is_some() && !e.frame_pending;
+            let want = e.transition.is_some() && !e.frame_pending && !terminal_fade;
             if want {
                 e.frame_pending = true;
             }
