@@ -2,7 +2,7 @@
 # Published to crates.io as `niri-bg`; the binary and the `niribg` library
 # target keep the compact name.
 name = "niri-bg"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Wallpaper daemon for the niri Wayland compositor, with blur on overview"
 repository = "https://github.com/alexsnaps/niribg"
