@@ -8,6 +8,7 @@
 //! that lacks those globals falls back to integer `wl_surface` buffer scale.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -126,9 +127,10 @@ pub(super) struct OutputEntry {
     /// Physical size of the buffer currently on screen, if any.
     pub painted: Option<Size>,
     /// The last render's buffers, retained so an overview toggle / `set` can
-    /// crossfade between them. Both are BGRA at `buffers_size`.
-    pub sharp: Option<Vec<u8>>,
-    pub blurred: Option<Vec<u8>>,
+    /// crossfade between them. Both are BGRA at `buffers_size`. `Rc` so a live
+    /// [`Transition`] can share them instead of copying ~20 MiB per fade.
+    pub sharp: Option<Rc<Vec<u8>>>,
+    pub blurred: Option<Rc<Vec<u8>>>,
     pub buffers_size: Option<Size>,
     /// Which of the two buffers is (or is fading toward being) on screen.
     pub showing: Showing,
@@ -149,10 +151,12 @@ pub(super) enum Showing {
 }
 
 /// An in-flight crossfade: displayed pixels are `blend(from, to, anim.eased())`
-/// until `anim.done()`, then `to` exactly. `from`/`to` are BGRA at `size`.
+/// until `anim.done()`, then `to` exactly. `from`/`to` are BGRA at `size`,
+/// shared (`Rc`) with the output's retained `sharp` / `blurred` where they
+/// match — only an interrupted fade's `from` is a freshly-owned snapshot.
 pub(super) struct Transition {
-    pub from: Vec<u8>,
-    pub to: Vec<u8>,
+    pub from: Rc<Vec<u8>>,
+    pub to: Rc<Vec<u8>>,
     pub size: Size,
     pub anim: Anim,
 }
@@ -404,8 +408,8 @@ impl DaemonState {
             None => {
                 let color = resolved.color;
                 if let Some(e) = self.wl.outputs.get_mut(id) {
-                    e.sharp = Some(render::solid(color, phys));
-                    e.blurred = Some(render::solid(color.dimmed(dim), phys));
+                    e.sharp = Some(Rc::new(render::solid(color, phys)));
+                    e.blurred = Some(Rc::new(render::solid(color.dimmed(dim), phys)));
                     e.buffers_size = Some(phys);
                 }
                 self.present_target(id, instant);
@@ -497,14 +501,19 @@ impl DaemonState {
         self.commit_frame(id, Frame::Fade(0.0), size); // re-requests a frame while a transition is live
     }
 
-    /// The exact pixels currently on screen for `id` (a mid-fade blend, or a
-    /// clone of the shown buffer). Empty if nothing is composited yet.
-    fn current_displayed(&self, id: &ObjectId) -> Vec<u8> {
+    /// The exact pixels currently on screen for `id` — a shared handle to the
+    /// shown buffer, or a freshly-owned mid-fade blend when a crossfade is
+    /// interrupted. Empty if nothing is composited yet.
+    fn current_displayed(&self, id: &ObjectId) -> Rc<Vec<u8>> {
         let Some(entry) = self.wl.outputs.get(id) else {
-            return Vec::new();
+            return Rc::new(Vec::new());
         };
         if let Some(tr) = &entry.transition {
-            return render::blend(&tr.from, &tr.to, tr.anim.eased());
+            return Rc::new(render::blend(
+                tr.from.as_slice(),
+                tr.to.as_slice(),
+                tr.anim.eased(),
+            ));
         }
         match entry.showing {
             Showing::Blurred => entry.blurred.clone().unwrap_or_default(),
@@ -582,7 +591,9 @@ impl DaemonState {
                     // `Vec` is ever allocated per fade frame.
                     Frame::Fade(t) => {
                         match self.wl.outputs.get(id).and_then(|e| e.transition.as_ref()) {
-                            Some(tr) => render::blend_into(canvas, &tr.from, &tr.to, t),
+                            Some(tr) => {
+                                render::blend_into(canvas, tr.from.as_slice(), tr.to.as_slice(), t);
+                            }
                             None => {
                                 tracing::error!("commit_frame(Fade) with no live transition");
                                 return;
@@ -666,8 +677,8 @@ impl DaemonState {
                 Some(id) if fresh => {
                     if let Some(e) = self.wl.outputs.get_mut(id) {
                         e.buffers_size = Some(rendered.size);
-                        e.sharp = Some(rendered.sharp);
-                        e.blurred = Some(rendered.blurred);
+                        e.sharp = Some(Rc::new(rendered.sharp));
+                        e.blurred = Some(Rc::new(rendered.blurred));
                     }
                     self.present_target(id, !result.fade);
                     None
