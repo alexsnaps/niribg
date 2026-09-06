@@ -116,9 +116,8 @@ pub fn run(socket: &Path, config_path: Option<PathBuf>, replace: bool) -> Result
         .map_err(|e| anyhow::anyhow!("registering control socket: {e}"))?;
 
     handle
-        .insert_source(
-            signals,
-            |event, _, state: &mut DaemonState| match event.signal() {
+        .insert_source(signals, |event, _, state: &mut DaemonState| {
+            match event.signal() {
                 Signal::SIGHUP => {
                     tracing::info!("SIGHUP: reloading config");
                     if let Err(e) = state.reload() {
@@ -129,8 +128,8 @@ pub fn run(socket: &Path, config_path: Option<PathBuf>, replace: bool) -> Result
                     tracing::info!(signal = ?other, "shutting down");
                     state.loop_signal.stop();
                 }
-            },
-        )
+            }
+        })
         .map_err(|e| anyhow::anyhow!("registering signals: {e}"))?;
 
     // Kick off the niri IPC connection (self-reconnecting via a timer).

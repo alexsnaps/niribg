@@ -96,16 +96,28 @@ mod tests {
 
     #[test]
     fn ease_out_leads_linear_in_the_first_half() {
-        let a = aged(Duration::from_millis(200), Duration::from_millis(100), Ease::Out);
+        let a = aged(
+            Duration::from_millis(200),
+            Duration::from_millis(100),
+            Ease::Out,
+        );
         let p = a.progress();
         assert!((0.45..=0.55).contains(&p), "progress {p}");
-        assert!(a.eased() > p, "ease-out {} not ahead of linear {p}", a.eased());
+        assert!(
+            a.eased() > p,
+            "ease-out {} not ahead of linear {p}",
+            a.eased()
+        );
         assert!(a.eased() < 1.0);
     }
 
     #[test]
     fn ease_in_trails_linear_in_the_first_half() {
-        let a = aged(Duration::from_millis(200), Duration::from_millis(100), Ease::In);
+        let a = aged(
+            Duration::from_millis(200),
+            Duration::from_millis(100),
+            Ease::In,
+        );
         let p = a.progress();
         assert!((0.45..=0.55).contains(&p), "progress {p}");
         assert!(a.eased() < p, "ease-in {} not behind linear {p}", a.eased());
@@ -119,7 +131,10 @@ mod tests {
         for ms in [0, 45, 120, 210, 285, 300] {
             let inn = aged(d, Duration::from_millis(ms), Ease::In).eased();
             let out = aged(d, Duration::from_millis(300 - ms), Ease::Out).eased();
-            assert!((inn - (1.0 - out)).abs() < 1e-5, "at {ms}ms: in {inn}, out {out}");
+            assert!(
+                (inn - (1.0 - out)).abs() < 1e-5,
+                "at {ms}ms: in {inn}, out {out}"
+            );
         }
     }
 
