@@ -3,8 +3,14 @@
 # noted. Full reference: the "Configuration" section of the README.
 
 # Crossfade duration for blur toggles and wallpaper swaps, in milliseconds.
-# 0 disables all fades.
+# 0 disables all fades. This is the duration when the overview opens (ease-out);
+# the wallpaper eases back to sharp on close.
 transition_ms = 250
+
+# Closing the overview eases in, and runs for this multiple of transition_ms —
+# 0.25 is a quarter as long, a quick snap back; 1.0 matches the open. 0.0..=4.0;
+# 0.0 = instant.
+ease_in_duration_ratio = 0.25
 
 [blur]
 # When false, niribg is only a wallpaper daemon (no blur on overview).

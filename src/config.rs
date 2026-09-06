@@ -78,8 +78,15 @@ impl std::str::FromStr for Mode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Crossfade duration in milliseconds; `0` means an instant swap.
+    /// Crossfade duration in milliseconds; `0` means an instant swap. This is
+    /// the *opening* (ease-out) duration; the close is scaled by
+    /// [`Self::ease_in_duration_ratio`].
     pub transition_ms: u32,
+    /// Duration of the *closing* crossfade (overview → sharp, ease-in) as a
+    /// multiple of [`Self::transition_ms`], `0.0..=4.0`. Defaults to `0.25`
+    /// for a quick snap back out of the overview; `1.0` matches the open,
+    /// above that the close is slower. `0.0` makes it instant.
+    pub ease_in_duration_ratio: f64,
     pub blur: BlurConfig,
     /// Keyed by output connector name, plus the special [`DEFAULT_SLOT`].
     pub output: BTreeMap<String, OutputConfig>,
@@ -89,6 +96,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             transition_ms: 250,
+            ease_in_duration_ratio: 0.25,
             blur: BlurConfig::default(),
             output: BTreeMap::new(),
         }
@@ -206,6 +214,12 @@ impl Config {
                 self.blur.dim
             );
         }
+        if !(0.0..=4.0).contains(&self.ease_in_duration_ratio) {
+            bail!(
+                "ease_in_duration_ratio must be between 0.0 and 4.0 (got {})",
+                self.ease_in_duration_ratio
+            );
+        }
         Ok(())
     }
 
@@ -248,6 +262,7 @@ mod tests {
         let c = Config::parse("").unwrap();
         assert_eq!(c, Config::default());
         assert_eq!(c.transition_ms, 250);
+        assert_eq!(c.ease_in_duration_ratio, 0.25);
         assert!(c.blur.enable);
         assert_eq!(c.blur.radius, 30);
         assert_eq!(c.blur.dim, 0.15);
@@ -273,6 +288,20 @@ mod tests {
         assert!(Config::parse("[blur]\ndim = 0.9").is_err());
         assert!(Config::parse("[blur]\ndim = -0.1").is_err());
         assert!(Config::parse("[blur]\ndim = 0.5").is_ok());
+    }
+
+    #[test]
+    fn ease_in_duration_ratio_out_of_range_rejected() {
+        assert!(Config::parse("ease_in_duration_ratio = 4.5").is_err());
+        assert!(Config::parse("ease_in_duration_ratio = -0.1").is_err());
+        assert!(Config::parse("ease_in_duration_ratio = 0.0").is_ok());
+        assert!(Config::parse("ease_in_duration_ratio = 4.0").is_ok());
+        assert_eq!(
+            Config::parse("ease_in_duration_ratio = 2.0")
+                .unwrap()
+                .ease_in_duration_ratio,
+            2.0
+        );
     }
 
     #[test]

@@ -494,7 +494,18 @@ impl DaemonState {
             _ => return, // nothing composited yet
         };
 
-        let dur = Duration::from_millis(u64::from(self.config.transition_ms));
+        // The open (ease-out) fade runs the full `transition_ms`; the close
+        // (ease-in) is scaled by `ease_in_duration_ratio`. `validate()` keeps
+        // the ratio in `0.0..=4.0`; clamp anyway for the default-constructed
+        // path.
+        let dur_ms = match ease {
+            Ease::Out => u64::from(self.config.transition_ms),
+            Ease::In => {
+                let ratio = self.config.ease_in_duration_ratio.clamp(0.0, 4.0);
+                (f64::from(self.config.transition_ms) * ratio).round() as u64
+            }
+        };
+        let dur = Duration::from_millis(dur_ms);
         let current = self.current_displayed(id);
         let can_fade =
             !instant && !dur.is_zero() && current.len() == target.len() && !current.is_empty();

@@ -83,8 +83,12 @@ every key optional. Override the path with `--config`.
 
 ```toml
 # Crossfade duration for blur toggles and wallpaper swaps, milliseconds.
-# 0 disables all fades (instant swaps everywhere).
+# 0 disables all fades (instant swaps everywhere). This is the *opening*
+# (ease-out) duration.
 transition_ms = 250
+# Closing the overview eases in and runs for this multiple of transition_ms —
+# 0.25 is a quick snap back, 1.0 matches the open. 0.0 .. 4.0; 0.0 = instant.
+ease_in_duration_ratio = 0.25
 
 [blur]
 # When false, niribg is just a wallpaper daemon: it still connects to niri
@@ -112,7 +116,8 @@ mode = "fit"
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `transition_ms` | integer | `250` | crossfade ms; `0` = instant |
+| `transition_ms` | integer | `250` | open (ease-out) crossfade ms; `0` = instant |
+| `ease_in_duration_ratio` | float | `0.25` | close (ease-in) duration as a multiple of `transition_ms`; `0.0`–`4.0`, out of range is a hard error |
 | `blur.enable` | bool | `true` | |
 | `blur.radius` | integer | `30` | px at ¼ resolution |
 | `blur.dim` | float | `0.15` | `0.0`–`0.5`; out of range is a hard error |
