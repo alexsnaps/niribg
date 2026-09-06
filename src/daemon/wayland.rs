@@ -39,7 +39,7 @@ use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1:
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 
-use super::anim::Anim;
+use super::anim::{Anim, Ease};
 use super::ipc::{SetDispatch, SetRequest};
 use super::render::{self, Size};
 use super::{DaemonState, PendingSet};
@@ -430,7 +430,7 @@ impl DaemonState {
                     e.blurred = Some(Rc::new(render::solid(color.dimmed(dim), phys)));
                     e.buffers_size = Some(phys);
                 }
-                self.present_target(id, instant);
+                self.present_target(id, instant, Ease::Out);
                 self.note_result(token, &name, None);
             }
             Some(path) => {
@@ -457,7 +457,8 @@ impl DaemonState {
     }
 
     /// Overview opened or closed: crossfade every output between its sharp
-    /// and blurred buffer.
+    /// and blurred buffer. Opening eases out, closing eases in — the mirror
+    /// curve — so the pair reads as one motion run forward then back.
     pub(super) fn set_overview_open(&mut self, open: bool) {
         if self.overview_open == open {
             return;
@@ -467,16 +468,19 @@ impl DaemonState {
         if !self.config.blur.enable {
             return; // nothing to swap
         }
+        let ease = if open { Ease::Out } else { Ease::In };
         let ids: Vec<ObjectId> = self.wl.outputs.keys().cloned().collect();
         for id in ids {
-            self.present_target(&id, false);
+            self.present_target(&id, false, ease);
         }
     }
 
     /// Show the buffer that matches the current overview state — blurred when
     /// the overview is open and blur is enabled, else sharp. `instant`
-    /// commits it directly; otherwise start (or retarget) a crossfade.
-    fn present_target(&mut self, id: &ObjectId, instant: bool) {
+    /// commits it directly; otherwise start (or retarget) a crossfade with
+    /// `ease` (overview toggles mirror the curve; every other repaint eases
+    /// out).
+    fn present_target(&mut self, id: &ObjectId, instant: bool, ease: Ease) {
         let Some(entry) = self.wl.outputs.get(id) else {
             return;
         };
@@ -513,7 +517,7 @@ impl DaemonState {
             from: current,
             to: target,
             size,
-            anim: Anim::new(dur),
+            anim: Anim::new(dur, ease),
         });
         // `Fade(0.0)` copies `from` (== the old `current`) into the canvas.
         self.commit_frame(id, Frame::Fade(0.0), size); // re-requests a frame while a transition is live
@@ -703,7 +707,9 @@ impl DaemonState {
                         e.sharp = Some(Rc::new(rendered.sharp));
                         e.blurred = Some(Rc::new(rendered.blurred));
                     }
-                    self.present_target(id, !result.fade);
+                    // A freshly rendered wallpaper settles in; the mirror
+                    // ease-in is reserved for closing the overview.
+                    self.present_target(id, !result.fade, Ease::Out);
                     None
                 }
                 Some(_) => {
