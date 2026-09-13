@@ -76,6 +76,38 @@ niribg get
 `niribg` replaces any other wallpaper client — disable `swaybg` / `swww` /
 your shell's built-in wallpaper, or you'll get flicker between the two.
 
+### Optional: a stationary wallpaper via niri's backdrop
+
+By default niri scrolls the wallpaper along with the workspaces and hides it
+behind `backdrop-color` in the overview. If you'd rather the wallpaper stay
+put behind everything, tell niri to place niribg's layer surface *within the
+backdrop* and make the per-workspace background colour transparent
+(`~/.config/niri/config.kdl`):
+
+```kdl
+// niribg's layer-shell namespace is "niribg" (check with `niri msg layers`).
+layer-rule {
+    match namespace="^niribg$"
+    place-within-backdrop true
+}
+
+// Otherwise the workspace colour now sits on top of the wallpaper.
+layout {
+    background-color "transparent"
+}
+
+// Optional: drop the workspace drop-shadows in the overview.
+overview {
+    workspace-shadow {
+        off
+    }
+}
+```
+
+niribg's blur still works: it swaps the same surface for the blurred buffer
+when the overview opens, so the backdrop itself blurs. Needs niri 25.05 or
+later for `place-within-backdrop` and `background-color`.
+
 ## Configuration
 
 `$XDG_CONFIG_HOME/niribg/config.toml` (→ `~/.config/niribg/config.toml`),
